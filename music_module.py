@@ -12,9 +12,11 @@ import shutil
 import sys
 import wave
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import monster_siren_client as siren
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPointF, Property, QPropertyAnimation, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Property, QPropertyAnimation, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -39,10 +41,16 @@ LOCAL_DIR = BASE_DIR / "local"
 MUSIC_LIBRARY_DIR = LOCAL_DIR / "music"
 PREFERENCE_DIR = LOCAL_DIR / "preferences"
 CACHE_DIR = LOCAL_DIR / "cache"
+ARTWORK_DIR = LOCAL_DIR / "artwork_cache"
 SETTINGS_FILE = PREFERENCE_DIR / "settings.json"
 LIBRARY_STATE_FILE = PREFERENCE_DIR / "library_state.json"
 APP_SETTINGS = {"language": "zh"}
 ACTIVE_THEME = "night"
+
+
+class NetworkResults(QObject):
+    finished = Signal(str, object, object)
+
 
 
 def TXT(zh, en):
@@ -1059,6 +1067,17 @@ class MusicPage(QWidget):
         self._clear_music_cache()
 
         self.tracks = []
+        self.local_tracks = []
+        self.online_tracks = []
+        self.source_kind = "online"
+        self.online_limit = 90
+        self.network = NetworkResults(self)
+        self.network.finished.connect(self._network_done)
+        self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="velia-artwork")
+        self.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="velia-audio")
+        self._selection_token = 0
+        self._pending_save = False
+        self._cover_pending = set()
         self.current_index = -1
         self.current_lyrics = []
         self.current_lyric_index = -1
@@ -1094,6 +1113,196 @@ class MusicPage(QWidget):
         self._load_customization()
         self._apply_theme()
         QTimer.singleShot(0, self.reload_library)
+        QTimer.singleShot(100, self._load_online_catalogue)
+
+    def _submit(self, kind, fn, *args):
+        priority = kind.startswith(("audio:", "catalogue", "wiki:"))
+        future = (self.media_executor if priority else self.executor).submit(fn, *args)
+        def deliver(done):
+            try:
+                self.network.finished.emit(kind, done.result(), None)
+            except Exception as exc:
+                self.network.finished.emit(kind, None, str(exc))
+        future.add_done_callback(deliver)
+
+    def _load_online_catalogue(self):
+        snapshot = PREFERENCE_DIR / "siren_catalogue.json"
+        try:
+            cached = json.loads(snapshot.read_text(encoding="utf-8"))
+            if isinstance(cached, list) and cached:
+                self._install_online_catalogue(cached)
+        except (OSError, ValueError):
+            pass
+        self._submit("catalogue", siren.catalogue)
+
+    def _install_online_catalogue(self, songs):
+        previously = (self.tracks[self.current_index].get("cid")
+                      if self.source_kind == "online" and 0 <= self.current_index < len(self.tracks) else None)
+        self.online_tracks = []
+        for s in songs:
+            cid = str(s.get("cid", ""))
+            if not cid.isdigit():
+                continue
+            key = "siren/" + cid
+            self.online_tracks.append({
+                "online": True, "cid": cid, "path": key,
+                "title": s.get("title", "—"), "artist": s.get("artist", "—"),
+                "album": s.get("album", ""), "album_cid": s.get("album_cid", ""),
+                "cover_url": s.get("cover_url", ""), "cover_bytes": None,
+                "cover_desc": TXT("塞壬唱片", "Monster Siren"), "track": "", "year": "",
+                "duration_ms": 0, "lyrics": [],
+                "favorite": bool(self.library_state.get("favorites", {}).get(key)),
+                "category": str(self.library_state.get("categories", {}).get(key, "")),
+            })
+        if self.source_kind == "online":
+            self.tracks = self.online_tracks
+            self.current_index = -1
+            self._rebuild_playlist()
+            self.scan_status.setText(TXT(f"塞壬唱片 · {len(self.tracks)} 首", f"Monster Siren · {len(self.tracks)} tracks"))
+            if self.tracks:
+                target = next((i for i, t in enumerate(self.tracks) if t["cid"] == previously), 0)
+                self.select_track(target, autoplay=False)
+
+    def _network_done(self, kind, value, error):
+        if kind == "catalogue":
+            if error:
+                if not self.online_tracks:
+                    self.scan_status.setText(TXT("在线曲库暂不可用 · 请检查网络", "Online catalogue unavailable · check connection"))
+                return
+            _write_json(PREFERENCE_DIR / "siren_catalogue.json", value)
+            if [t["cid"] for t in self.online_tracks] != [str(t.get("cid")) for t in value]:
+                self._install_online_catalogue(value)
+        elif kind.startswith("cover:"):
+            cid = kind.split(":", 1)[1]
+            self._cover_pending.discard(cid)
+            if not error and value:
+                ARTWORK_DIR.mkdir(parents=True, exist_ok=True)
+                (ARTWORK_DIR / (cid + ".img")).write_bytes(value)
+                for track in self.online_tracks:
+                    if track["cid"] == cid:
+                        track["cover_bytes"] = value
+                        if self.source_kind == "online" and self.current_index >= 0 and self.tracks[self.current_index] is track:
+                            self.hero_cover.setPixmap(_rounded_cover(self._pixmap_for_track(track, 112), 112, 17))
+                        break
+                if self.source_kind == "online" and not getattr(self, "_cover_refresh_scheduled", False):
+                    self._cover_refresh_scheduled = True
+                    QTimer.singleShot(240, self._refresh_cover_rows)
+        elif kind.startswith("audio:"):
+            _, token, cid = kind.split(":")
+            if str(self._selection_token) != token or self.current_index < 0 or self.tracks[self.current_index].get("cid") != cid:
+                return
+            self.play_btn.setEnabled(True)
+            if error:
+                self.scan_status.setText(TXT("下载失败：", "Download failed: ") + error[:120])
+                return
+            track = self.tracks[self.current_index]
+            path, detail, album, lyrics = value
+            track["lyrics"] = lyrics
+            track["track"] = str(next((i for i, x in enumerate(album.get("songs", [])) if str(x.get("cid")) == cid), -1) + 1) if album else ""
+            track["intro"] = (album or {}).get("intro", "")
+            if not track["intro"]:
+                self._submit("wiki:" + token, siren.wiki_fallback, track["title"])
+            self.current_lyrics = lyrics
+            self._update_lyric_roller(-1)
+            self._show_track_details(track)
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+            self.player.play()
+            self.scan_status.setText(TXT("正在播放 · 临时缓存", "Playing · temporary cache"))
+            if self._pending_save:
+                self._save_online_track()
+        elif kind.startswith("wiki:"):
+            _, token = kind.split(":")
+            if str(self._selection_token) == token and self.current_index >= 0 and value:
+                track = self.tracks[self.current_index]
+                if track.get("online") and not track.get("intro"):
+                    track["intro"] = value[0]["summary"]
+                    track["intro_source"] = value[0]["url"]
+                    self._show_track_details(track)
+
+    def _online_job(self, track):
+        cid = track["cid"]
+        detail = siren.song_detail(cid)
+        album = {}
+        if track.get("album_cid"):
+            try:
+                album = siren.album_detail(track["album_cid"])
+            except Exception:
+                pass
+        url = detail.get("sourceUrl", "")
+        suffix = Path(__import__("urllib.parse", fromlist=["urlparse"]).urlparse(url).path).suffix.lower()
+        if suffix not in (".wav", ".mp3", ".flac", ".ogg", ".m4a"):
+            suffix = ".wav"
+        path = CACHE_DIR / "siren" / "audio" / (cid + suffix)
+        siren.download(url, path)
+        lyrics = []
+        if detail.get("lyricUrl"):
+            try:
+                raw = siren.fetch_bytes(detail["lyricUrl"], 2 * 1024 * 1024)
+                lrc = path.with_suffix(".lrc")
+                lrc.write_bytes(raw)
+                lyrics = _parse_lrc(lrc)
+            except Exception:
+                pass
+        return path, detail, album, lyrics
+
+    def _refresh_cover_rows(self):
+        self._cover_refresh_scheduled = False
+        if self.source_kind == "online":
+            self._rebuild_playlist()
+
+    def _switch_source(self, index):
+        self._selection_token += 1
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.source_kind = self.source_combo.itemData(index)
+        self.tracks = self.online_tracks if self.source_kind == "online" else self.local_tracks
+        self.current_index = -1
+        self.online_limit = 90
+        self._rebuild_playlist()
+        self.scan_status.setText(TXT(f"已列出 {len(self.tracks)} 首歌曲", f"{len(self.tracks)} tracks available"))
+        if self.tracks:
+            self.select_track(0, autoplay=False)
+        else:
+            self.hero_title.setText(TXT("暂无歌曲", "No tracks"))
+            self.hero_cover.clear()
+            self._sync_hero_favorite()
+
+    def _save_online_track(self):
+        if self.current_index < 0 or not self.tracks[self.current_index].get("online"):
+            return
+        track = self.tracks[self.current_index]
+        source = next((p for p in (CACHE_DIR / "siren" / "audio").glob(track["cid"] + ".*") if p.suffix != ".lrc"), None)
+        if source is None:
+            self._pending_save = True
+            self.scan_status.setText(TXT("下载完成后保存到本地…", "Saving after download…"))
+            return
+        self._pending_save = False
+        folder = MUSIC_LIBRARY_DIR / "Monster Siren"
+        folder.mkdir(parents=True, exist_ok=True)
+        destination = folder / (track["cid"] + " - " + re.sub(r'[<>:"/\\|?*]', "_", track["title"])[:90] + source.suffix)
+        shutil.copy2(source, destination)
+        for ext in (".lrc",):
+            lyric_path = source.with_suffix(ext)
+            if lyric_path.exists():
+                shutil.copy2(lyric_path, destination.with_suffix(ext))
+        cover = track.get("cover_bytes")
+        if cover:
+            destination.with_suffix(".jpg").write_bytes(cover)
+        (destination.with_suffix(".json")).write_text(json.dumps({
+            "source": siren.ROOT + "/music/song/" + track["cid"],
+            "title": track["title"], "artist": track["artist"],
+            "album": track["album"], "intro": track.get("intro", ""),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.scan_status.setText(TXT("已保留到本地音乐文件夹", "Saved to local music folder"))
+
+    def _show_track_details(self, track):
+        for key, name in (("Album", "album"), ("Track", "track"), ("Year", "year"), ("Cover", "cover_desc")):
+            self.detail_values[key].setText(str(track.get(name) or "—"))
+        intro = track.get("intro") or ""
+        self.album_intro.setText(re.sub(r"<[^>]+>", "", intro)[:500])
+        self.album_intro.setToolTip(track.get("intro_source") or
+                                    (siren.ROOT + "/" if track.get("online") else ""))
+        self.album_intro.setVisible(bool(intro))
 
     def _localized_label(self, zh, en):
         label = QLabel(TXT(zh, en))
@@ -1133,6 +1342,10 @@ class MusicPage(QWidget):
             self.theme_combo.setItemText(row, TXT(zh, en))
         self.open_folder_btn.setText(TXT("打开音乐文件夹", "Open Music Folder"))
         self.open_preference_btn.setText(TXT("打开偏好设置文件夹", "Open Preferences Folder"))
+        self.source_combo.setItemText(0, TXT("塞壬唱片 · 在线", "Monster Siren · Online"))
+        self.source_combo.setItemText(1, TXT("本地音乐", "Local Music"))
+        self.search_box.setPlaceholderText(TXT("搜索歌曲或专辑…", "Search tracks or albums…"))
+        self.save_online_btn.setText(TXT("保留到本地", "Keep Locally"))
         self.add_category_btn.setToolTip(TXT("新建分类", "New Category"))
         self.batch_add_btn.setToolTip(TXT("批量加入歌曲", "Batch Add Tracks"))
         self.delete_category_btn.setToolTip(TXT("删除当前歌单 / 分类", "Delete Current Playlist / Category"))
@@ -1215,6 +1428,8 @@ class MusicPage(QWidget):
         self.customize_nav.setChecked(index == 1)
 
     def _track_key(self, path):
+        if isinstance(path, str) and path.startswith("siren/"):
+            return path
         try:
             return str(Path(path).resolve().relative_to(self.library_dir.resolve())).replace("\\", "/")
         except Exception:
@@ -1666,6 +1881,18 @@ class MusicPage(QWidget):
         ll.addLayout(playlist_head)
         self._rebuild_category_combo()
 
+        online_row = QHBoxLayout()
+        self.source_combo = VisibleComboBox()
+        self.source_combo.addItem(TXT("塞壬唱片 · 在线", "Monster Siren · Online"), "online")
+        self.source_combo.addItem(TXT("本地音乐", "Local Music"), "local")
+        self.source_combo.currentIndexChanged.connect(self._switch_source)
+        online_row.addWidget(self.source_combo)
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText(TXT("搜索歌曲或专辑…", "Search tracks or albums…"))
+        self.search_box.textChanged.connect(self._search_changed)
+        online_row.addWidget(self.search_box, 1)
+        ll.addLayout(online_row)
+
         self.scan_status = QLabel("")
         self.scan_status.setStyleSheet("color:#777; font-size:11px;")
         self.scan_status.setWordWrap(True)
@@ -1773,6 +2000,18 @@ class MusicPage(QWidget):
         now.addWidget(self.hero_artist, 0, Qt.AlignRight)
         header.addLayout(now)
         rl.addLayout(header)
+        self.album_intro = QLabel("")
+        self.album_intro.setWordWrap(True)
+        self.album_intro.setMaximumHeight(76)
+        self.album_intro.setStyleSheet("color:#858585; font-size:11px; padding:2px 5px;")
+        self.album_intro.hide()
+        rl.addWidget(self.album_intro)
+
+        self.save_online_btn = FloatingButton(TXT("保留到本地", "Keep Locally"))
+        self.save_online_btn.setObjectName("chipButton")
+        self.save_online_btn.clicked.connect(self._save_online_track)
+        self.save_online_btn.hide()
+        rl.addWidget(self.save_online_btn, 0, Qt.AlignRight)
 
         # Large lyric roller area between metadata and transport.
         lyric_frame = QFrame()
@@ -2200,6 +2439,22 @@ class MusicPage(QWidget):
         tracks = []
         for path in sorted(audio_files, key=lambda p: (p.name.casefold(), str(p).casefold())):
             info = _read_track_info(path)
+            sidecar = path.with_suffix(".json")
+            if sidecar.is_file():
+                try:
+                    stored = json.loads(sidecar.read_text(encoding="utf-8"))
+                    if isinstance(stored, dict) and stored.get("source", "").startswith(siren.ROOT):
+                        for field in ("title", "artist", "album", "intro"):
+                            info[field] = stored.get(field) or info.get(field, "")
+                except (OSError, ValueError):
+                    pass
+            cover_file = path.with_suffix(".jpg")
+            if cover_file.is_file():
+                try:
+                    info["cover_bytes"] = cover_file.read_bytes()
+                    info["cover_desc"] = TXT("本地封面", "Local cover")
+                except OSError:
+                    pass
             local_lrc = path.with_suffix(".lrc")
             lrc = local_lrc if local_lrc.exists() else None
             if lrc is None:
@@ -2212,11 +2467,12 @@ class MusicPage(QWidget):
             info["category"] = str(self.library_state.get("categories", {}).get(key, ""))
             tracks.append(info)
 
-        self.tracks = tracks
+        self.local_tracks = tracks
+        self.tracks = self.online_tracks if self.source_kind == "online" else self.local_tracks
         self._rebuild_playlist()
         self.scan_status.setText(TXT(
-            f"已读取 {len(tracks)} 首歌曲",
-            f"{len(tracks)} tracks loaded"
+            f"本地 {len(tracks)} 首 · 塞壬唱片 {len(self.online_tracks)} 首",
+            f"Local {len(tracks)} · Monster Siren {len(self.online_tracks)}"
         ))
 
         match = next(
@@ -2225,7 +2481,7 @@ class MusicPage(QWidget):
             None,
         )
         if self.tracks:
-            self.select_track(match if match is not None else 0)
+            self.select_track(match if match is not None else 0, autoplay=False)
         else:
             self.current_index = -1
             self.current_lyrics = []
@@ -2286,6 +2542,10 @@ class MusicPage(QWidget):
                 return False
         return True
 
+    def _search_changed(self):
+        self.online_limit = 90
+        self._rebuild_playlist()
+
     def _rebuild_playlist(self):
         while self.playlist_layout.count() > 1:
             item = self.playlist_layout.takeAt(0)
@@ -2298,6 +2558,23 @@ class MusicPage(QWidget):
             for i, track in enumerate(self.tracks)
             if self._track_visible_in_active_category(track)
         ]
+        query = self.search_box.text().strip().casefold() if hasattr(self, "search_box") else ""
+        if query:
+            visible = [(i, track) for i, track in visible if query in
+                       (track["title"] + " " + track["artist"] + " " + track["album"]).casefold()]
+        remaining = len(visible) - self.online_limit if self.source_kind == "online" else 0
+        if self.source_kind == "online":
+            visible = visible[:self.online_limit]
+            for _, track in visible:
+                cid = track["cid"]
+                if track.get("cover_bytes") or not track.get("cover_url") or cid in self._cover_pending:
+                    continue
+                cover_path = ARTWORK_DIR / (cid + ".img")
+                if cover_path.exists():
+                    track["cover_bytes"] = cover_path.read_bytes()
+                else:
+                    self._cover_pending.add(cid)
+                    self._submit("cover:" + cid, siren.fetch_bytes, track["cover_url"], 5 * 1024 * 1024)
 
         # Gather visible tracks by normalized album metadata.
         album_members = {}
@@ -2400,9 +2677,17 @@ class MusicPage(QWidget):
                 self.playlist_layout.count() - 1,
                 empty
             )
+        if remaining > 0:
+            more = FloatingButton(TXT(f"显示更多 · 剩余 {remaining} 首", f"Show more · {remaining} remaining"))
+            more.clicked.connect(self._show_more_online)
+            self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, more)
         if ACTIVE_THEME == "day":
             for widget in self.playlist_host.findChildren(QWidget):
                 recolor_widget(widget)
+
+    def _show_more_online(self):
+        self.online_limit += 90
+        self._rebuild_playlist()
 
 
     def _sync_hero_favorite(self):
@@ -2421,15 +2706,24 @@ class MusicPage(QWidget):
             self._set_track_favorite(self.current_index, bool(checked))
             self._sync_hero_favorite()
 
-    def select_track(self, index):
+    def select_track(self, index, autoplay=True):
         if index < 0 or index >= len(self.tracks):
             return
+        self._selection_token += 1
+        self._pending_save = False
         self.current_index = index
         track = self.tracks[index]
         self.current_lyrics = track.get("lyrics", [])
         self.current_lyric_index = -1
         self.player.stop()
-        self.player.setSource(QUrl.fromLocalFile(str(track["path"])))
+        self.player.setSource(QUrl())
+        if track.get("online") and autoplay:
+            self.play_btn.setEnabled(False)
+            self.scan_status.setText(TXT("正在获取歌曲并缓存…", "Fetching song into temporary cache…"))
+            self._submit("audio:" + str(self._selection_token) + ":" + track["cid"], self._online_job, dict(track))
+        elif not track.get("online"):
+            self.play_btn.setEnabled(True)
+            self.player.setSource(QUrl.fromLocalFile(str(track["path"])))
 
         self.detail_values["Title"].setText(track["title"] or "—")
         self.detail_values["Artist"].setText(track["artist"] or "—")
@@ -2446,11 +2740,18 @@ class MusicPage(QWidget):
         self.progress.setValue(0)
         self.current_time.setText("0:00")
         self._update_lyric_roller(-1)
+        self._show_track_details(track)
+        self.save_online_btn.setVisible(bool(track.get("online")))
+        if autoplay and not track.get("online"):
+            self.player.play()
 
     def _toggle_play(self):
         if self.current_index < 0 and self.tracks:
             self.select_track(0)
         if self.current_index < 0:
+            return
+        if self.tracks[self.current_index].get("online") and not self.player.source().isValid():
+            self.select_track(self.current_index)
             return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
@@ -2513,7 +2814,6 @@ class MusicPage(QWidget):
 
         if nxt >= 0:
             self.select_track(nxt)
-            self.player.play()
 
     def _next(self):
         if not self.tracks:
@@ -2524,7 +2824,6 @@ class MusicPage(QWidget):
             nxt = (self.current_index + 1) % len(self.tracks)
         if nxt >= 0:
             self.select_track(nxt)
-            self.player.play()
 
     def _previous(self):
         if not self.tracks:
@@ -2533,7 +2832,6 @@ class MusicPage(QWidget):
         # while random playback is enabled.
         prev = (self.current_index - 1) % len(self.tracks)
         self.select_track(prev)
-        self.player.play()
 
     def _media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
