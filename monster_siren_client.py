@@ -7,9 +7,15 @@ No media is downloaded until a song is selected or explicitly saved.
 import argparse
 import html
 import json
+import io
 import re
+import shutil
+import subprocess
+import tempfile
+import uuid
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = "https://monster-siren.hypergryph.com"
@@ -120,6 +126,104 @@ def wiki_fallback(title):
         except Exception:
             continue
     return results
+
+
+def prts_credits(title):
+    """Read a song's exact PRTS article linked from 音乐鉴赏.
+
+    The appreciation index itself lists titles, while individual pages list
+    release dates and production credits. Never infer a release year from
+    the game's timeline or a different song's article.
+    """
+    query = urllib.parse.urlencode({"action": "query", "prop": "extracts|info",
+        "titles": title, "redirects": 1, "explaintext": 1, "exchars": 7000,
+        "inprop": "url", "format": "json"})
+    try:
+        data = json.loads(fetch_bytes("https://prts.wiki/api.php?" + query))
+        pages = (data.get("query") or {}).get("pages") or {}
+        normalize = lambda s: re.sub(r"[^\w]+", "", s).casefold()
+        page = next((v for v in pages.values()
+                     if "missing" not in v and normalize(v.get("title", "")) == normalize(title)), None)
+        if not page:
+            return {}
+        body = html.unescape(page.get("extract") or "")
+        head = re.split(r"\n\s*(?:歌词|曲目|相关内容|导航)\s*\n", body, maxsplit=1)[0][:4500]
+        year = re.search(r"(?:于|发行日期|发布时间|发售日期)[^\n]{0,35}?(20\d{2})年\d{1,2}月", head)
+        if not year:
+            year = re.search(r"(20\d{2})年\d{1,2}月\d{1,2}日[^\n]{0,12}(?:发行|发布)", head)
+        composer = re.search(r"(?:作曲|音乐制作|编曲)\s*[:：]\s*([^\n]{2,95})", head)
+        if composer:
+            credit = composer.group(1).strip().split("  ")[0].strip()
+        else:
+            credit = ""
+        return {"year": year.group(1) if year else "", "composer": credit,
+                "url": page.get("fullurl") or "https://prts.wiki/w/" + urllib.parse.quote(title.replace(" ", "_"))}
+    except Exception:
+        return {}
+
+
+def ffmpeg_executable():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError):
+        return shutil.which("ffmpeg")
+
+
+def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
+                bitrate=256, sample_rate=44100):
+    """Create the user's ep_NAME/{ep_NAME.mp3,png,lrc} bundle atomically."""
+    audio_path = Path(audio_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", track["title"]).strip(" ._")[:85] or track["cid"]
+    stem = "ep_" + safe.replace(" ", "_")
+    destination = output_dir / (stem + ".zip")
+    stage = Path(tempfile.mkdtemp(prefix="velia_ep_"))
+    temporary_zip = output_dir / ("." + stem + "_" + uuid.uuid4().hex[:8] + ".part")
+    try:
+        target_audio = stage / (stem + (".mp3" if compress else audio_path.suffix.lower()))
+        if compress:
+            exe = ffmpeg_executable()
+            if not exe:
+                raise RuntimeError("FFmpeg not found. Install imageio-ffmpeg to enable MP3 conversion.")
+            command = [exe, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-i", str(audio_path), "-vn", "-codec:a", "libmp3lame",
+                       "-b:a", str(int(bitrate)) + "k", "-ar", str(int(sample_rate)),
+                       "-metadata", "title=" + track["title"],
+                       "-metadata", "artist=" + track.get("artist", ""),
+                       "-metadata", "album=" + track.get("album", ""),
+                       "-metadata", "date=" + track.get("year", ""),
+                       str(target_audio)]
+            proc = subprocess.run(command, capture_output=True, timeout=300,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode or not target_audio.is_file():
+                raise RuntimeError(proc.stderr.decode("utf-8", errors="replace")[-350:] or "MP3 encoding failed")
+        else:
+            shutil.copy2(audio_path, target_audio)
+        if lyric_path and Path(lyric_path).is_file():
+            shutil.copy2(lyric_path, stage / (stem + ".lrc"))
+        else:
+            (stage / (stem + ".lrc")).write_text("", encoding="utf-8")
+        cover = track.get("cover_bytes")
+        if not cover and track.get("cover_url"):
+            cover = fetch_bytes(track["cover_url"], 5 * 1024 * 1024)
+        from PySide6.QtGui import QImage
+        image = QImage.fromData(cover) if cover else QImage()
+        if image.isNull():
+            from PySide6.QtGui import QColor
+            image = QImage(512, 512, QImage.Format_ARGB32)
+            image.fill(QColor("#222630"))
+        image.save(str(stage / (stem + ".png")), "PNG")
+        with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
+            for file in sorted(stage.iterdir()):
+                if file.is_file() and file != temporary_zip:
+                    archive.write(file, stem + "/" + file.name)
+        temporary_zip.replace(destination)
+        return destination
+    finally:
+        temporary_zip.unlink(missing_ok=True)
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 if __name__ == "__main__":

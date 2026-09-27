@@ -10,6 +10,7 @@ import random
 import re
 import shutil
 import sys
+import threading
 import wave
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -771,6 +772,7 @@ class MusicTrackRow(QFrame):
         lay.setSpacing(10)
 
         cover = QLabel()
+        self.cover_label = cover
         cover.setFixedSize(48, 48)
         cover.setPixmap(_rounded_cover(cover_pixmap, 48, 12))
         cover.setStyleSheet("border-radius: 12px;")
@@ -825,9 +827,11 @@ class MusicTrackRow(QFrame):
 
 class MusicAlbumHeader(QFrame):
     """Visual header for a group of tracks sharing the same album metadata."""
+    toggled = Signal()
 
     def __init__(self, album_name, tracks, cover_pixmap, parent=None):
         super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("musicAlbumHeader")
         self.setStyleSheet("""
             QFrame#musicAlbumHeader {
@@ -843,6 +847,7 @@ class MusicAlbumHeader(QFrame):
         lay.setSpacing(10)
 
         cover = QLabel()
+        self.cover_label = cover
         cover.setFixedSize(56, 56)
         cover.setPixmap(
             _rounded_cover(cover_pixmap, 56, 12)
@@ -891,6 +896,17 @@ class MusicAlbumHeader(QFrame):
         words.addStretch(1)
 
         lay.addLayout(words, 1)
+        self.arrow = QLabel("›")
+        self.arrow.setStyleSheet("font-size:23px; color:#919191; background:transparent; border:0;")
+        lay.addWidget(self.arrow)
+
+    def set_expanded(self, expanded):
+        self.arrow.setText("⌄" if expanded else "›")
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggled.emit()
+        super().mouseReleaseEvent(event)
 
 
 class DesktopLyricsWindow(QWidget):
@@ -1070,14 +1086,25 @@ class MusicPage(QWidget):
         self.local_tracks = []
         self.online_tracks = []
         self.source_kind = "online"
-        self.online_limit = 90
+        self.online_limit = 55
+        self._more_scheduled = False
         self.network = NetworkResults(self)
         self.network.finished.connect(self._network_done)
         self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="velia-artwork")
         self.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="velia-audio")
         self._selection_token = 0
+        self._purge_token = -1
         self._pending_save = False
+        self._saving_count = 0
         self._cover_pending = set()
+        self._credits_pending = set()
+        self.album_expanded = set()
+        self._cover_widgets = {}
+        self.prts_cache_file = PREFERENCE_DIR / "prts_credits.json"
+        try:
+            self.prts_cache = json.loads(self.prts_cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.prts_cache = {}
         self.current_index = -1
         self.current_lyrics = []
         self.current_lyric_index = -1
@@ -1122,7 +1149,10 @@ class MusicPage(QWidget):
             try:
                 self.network.finished.emit(kind, done.result(), None)
             except Exception as exc:
-                self.network.finished.emit(kind, None, str(exc))
+                try:
+                    self.network.finished.emit(kind, None, str(exc))
+                except RuntimeError:
+                    pass
         future.add_done_callback(deliver)
 
     def _load_online_catalogue(self):
@@ -1184,11 +1214,15 @@ class MusicPage(QWidget):
                         if self.source_kind == "online" and self.current_index >= 0 and self.tracks[self.current_index] is track:
                             self.hero_cover.setPixmap(_rounded_cover(self._pixmap_for_track(track, 112), 112, 17))
                         break
-                if self.source_kind == "online" and not getattr(self, "_cover_refresh_scheduled", False):
-                    self._cover_refresh_scheduled = True
-                    QTimer.singleShot(240, self._refresh_cover_rows)
+                for label, size, radius in self._cover_widgets.get(cid, []):
+                    label.setPixmap(_rounded_cover(self._pixmap_for_track(track, size), size, radius))
         elif kind.startswith("audio:"):
             _, token, cid = kind.split(":")
+            if int(token) <= self._purge_token:
+                if value and value[0].exists():
+                    value[0].unlink(missing_ok=True)
+                    value[0].with_suffix(".lrc").unlink(missing_ok=True)
+                return
             if str(self._selection_token) != token or self.current_index < 0 or self.tracks[self.current_index].get("cid") != cid:
                 return
             self.play_btn.setEnabled(True)
@@ -1218,6 +1252,41 @@ class MusicPage(QWidget):
                     track["intro"] = value[0]["summary"]
                     track["intro_source"] = value[0]["url"]
                     self._show_track_details(track)
+        elif kind.startswith("credits:"):
+            cid = kind.split(":", 1)[1]
+            self._credits_pending.discard(cid)
+            self.prts_cache[cid] = value if isinstance(value, dict) else {}
+            try:
+                _write_json(self.prts_cache_file, self.prts_cache)
+            except OSError:
+                pass
+            for track in self.online_tracks:
+                if track["cid"] == cid:
+                    self._apply_credits(track, self.prts_cache[cid])
+                    break
+        elif kind.startswith("save:"):
+            self._saving_count = max(0, self._saving_count - 1)
+            self.clear_cache_btn.setEnabled(self._saving_count == 0)
+            self.refresh_btn.setEnabled(self._saving_count == 0)
+            self.save_online_btn.setEnabled(True)
+            self.scan_status.setText((TXT("保存失败：", "Save failed: ") + error[:150]) if error else
+                                     TXT(f"已保存：{value.name}", f"Saved: {value.name}"))
+
+    def _apply_credits(self, track, credits):
+        if credits:
+            track["year"] = credits.get("year") or track.get("year", "")
+            track["composer"] = credits.get("composer", "")
+            track["credits_url"] = credits.get("url", "")
+            if self.current_index >= 0 and self.tracks[self.current_index] is track:
+                self._show_track_details(track)
+
+    def _request_credits(self, track):
+        cid = track["cid"]
+        if cid in self.prts_cache:
+            self._apply_credits(track, self.prts_cache[cid])
+        elif cid not in self._credits_pending:
+            self._credits_pending.add(cid)
+            self._submit("credits:" + cid, siren.prts_credits, track["title"])
 
     def _online_job(self, track):
         cid = track["cid"]
@@ -1245,11 +1314,6 @@ class MusicPage(QWidget):
                 pass
         return path, detail, album, lyrics
 
-    def _refresh_cover_rows(self):
-        self._cover_refresh_scheduled = False
-        if self.source_kind == "online":
-            self._rebuild_playlist()
-
     def _switch_source(self, index):
         self._selection_token += 1
         self.player.stop()
@@ -1257,7 +1321,7 @@ class MusicPage(QWidget):
         self.source_kind = self.source_combo.itemData(index)
         self.tracks = self.online_tracks if self.source_kind == "online" else self.local_tracks
         self.current_index = -1
-        self.online_limit = 90
+        self.online_limit = 55
         self._rebuild_playlist()
         self.scan_status.setText(TXT(f"已列出 {len(self.tracks)} 首歌曲", f"{len(self.tracks)} tracks available"))
         if self.tracks:
@@ -1273,27 +1337,21 @@ class MusicPage(QWidget):
         track = self.tracks[self.current_index]
         source = next((p for p in (CACHE_DIR / "siren" / "audio").glob(track["cid"] + ".*") if p.suffix != ".lrc"), None)
         if source is None:
+            if self.play_btn.isEnabled():
+                self.select_track(self.current_index)
             self._pending_save = True
             self.scan_status.setText(TXT("下载完成后保存到本地…", "Saving after download…"))
             return
         self._pending_save = False
-        folder = MUSIC_LIBRARY_DIR / "Monster Siren"
-        folder.mkdir(parents=True, exist_ok=True)
-        destination = folder / (track["cid"] + " - " + re.sub(r'[<>:"/\\|?*]', "_", track["title"])[:90] + source.suffix)
-        shutil.copy2(source, destination)
-        for ext in (".lrc",):
-            lyric_path = source.with_suffix(ext)
-            if lyric_path.exists():
-                shutil.copy2(lyric_path, destination.with_suffix(ext))
-        cover = track.get("cover_bytes")
-        if cover:
-            destination.with_suffix(".jpg").write_bytes(cover)
-        (destination.with_suffix(".json")).write_text(json.dumps({
-            "source": siren.ROOT + "/music/song/" + track["cid"],
-            "title": track["title"], "artist": track["artist"],
-            "album": track["album"], "intro": track.get("intro", ""),
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
-        self.scan_status.setText(TXT("已保留到本地音乐文件夹", "Saved to local music folder"))
+        self._saving_count += 1
+        self.save_online_btn.setEnabled(False)
+        self.clear_cache_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+        self.scan_status.setText(TXT("后台整理并保存标准歌曲包…", "Creating song package in background…"))
+        self._submit("save:" + track["cid"], siren.save_ep_zip, dict(track), source,
+                     source.with_suffix(".lrc"), MUSIC_LIBRARY_DIR / "Monster Siren",
+                     bool(self.compress_check.isChecked()),
+                     int(self.bitrate_combo.currentData()), int(self.sample_combo.currentData()))
 
     def _show_track_details(self, track):
         for key, name in (("Album", "album"), ("Track", "track"), ("Year", "year"), ("Cover", "cover_desc")):
@@ -1303,6 +1361,10 @@ class MusicPage(QWidget):
         self.album_intro.setToolTip(track.get("intro_source") or
                                     (siren.ROOT + "/" if track.get("online") else ""))
         self.album_intro.setVisible(bool(intro))
+        composer = track.get("composer", "")
+        self.credits_label.setText(TXT("作曲：", "Composer: ") + composer if composer else "")
+        self.credits_label.setToolTip(track.get("credits_url", ""))
+        self.credits_label.setVisible(bool(composer))
 
     def _localized_label(self, zh, en):
         label = QLabel(TXT(zh, en))
@@ -1345,7 +1407,9 @@ class MusicPage(QWidget):
         self.source_combo.setItemText(0, TXT("塞壬唱片 · 在线", "Monster Siren · Online"))
         self.source_combo.setItemText(1, TXT("本地音乐", "Local Music"))
         self.search_box.setPlaceholderText(TXT("搜索歌曲或专辑…", "Search tracks or albums…"))
-        self.save_online_btn.setText(TXT("保留到本地", "Keep Locally"))
+        self.save_online_btn.setText(TXT("保存到本地", "Save Locally"))
+        self.compress_check.setText(TXT("后台转为 MP3 并压缩", "Convert to MP3 in background"))
+        self.clear_cache_btn.setText(TXT("一键清理临时歌曲缓存", "Clear Temporary Song Cache"))
         self.add_category_btn.setToolTip(TXT("新建分类", "New Category"))
         self.batch_add_btn.setToolTip(TXT("批量加入歌曲", "Batch Add Tracks"))
         self.delete_category_btn.setToolTip(TXT("删除当前歌单 / 分类", "Delete Current Playlist / Category"))
@@ -1376,7 +1440,7 @@ class MusicPage(QWidget):
         else:
             self.hero_title.setText(TXT("未选择歌曲", "No track selected"))
         self._update_lyric_roller(self.current_lyric_index)
-        self.window().setWindowTitle(TXT("Velia · 音乐播放器", "Velia · Music Player"))
+        self.window().setWindowTitle(TXT("Velia音乐播放器", "Velia Music Player"))
         if self.desktop_lyrics.editing:
             self.desktop_lyrics.set_position_editing(False)
             self.desktop_lyrics.set_position_editing(True)
@@ -1773,7 +1837,7 @@ class MusicPage(QWidget):
         root.setSpacing(12)
 
         top = QHBoxLayout()
-        title = self._localized_label("音乐播放器", "Music Player")
+        title = self._localized_label("Velia音乐播放器", "Velia Music Player")
         title.setObjectName("pageTitle")
         top.addWidget(title)
         top.addStretch(1)
@@ -1907,6 +1971,7 @@ class MusicPage(QWidget):
         self.playlist_layout.setSpacing(3)
         self.playlist_layout.addStretch(1)
         self.playlist_scroll.setWidget(self.playlist_host)
+        self.playlist_scroll.verticalScrollBar().valueChanged.connect(self._maybe_load_more)
         ll.addWidget(self.playlist_scroll, 1)
         main.addWidget(left)
 
@@ -2007,7 +2072,12 @@ class MusicPage(QWidget):
         self.album_intro.hide()
         rl.addWidget(self.album_intro)
 
-        self.save_online_btn = FloatingButton(TXT("保留到本地", "Keep Locally"))
+        self.credits_label = QLabel("")
+        self.credits_label.setStyleSheet("color:#858585; font-size:11px; padding:2px 5px;")
+        self.credits_label.hide()
+        rl.addWidget(self.credits_label)
+
+        self.save_online_btn = FloatingButton(TXT("保存到本地", "Save Locally"))
         self.save_online_btn.setObjectName("chipButton")
         self.save_online_btn.clicked.connect(self._save_online_track)
         self.save_online_btn.hide()
@@ -2171,16 +2241,61 @@ class MusicPage(QWidget):
         self.open_preference_btn.clicked.connect(self._open_preference_folder)
         grid.addWidget(self.open_preference_btn, 4, 0, 1, 2)
 
+        self.compress_check = VisibleCheckBox(TXT("后台转为 MP3 并压缩", "Convert to MP3 in background"))
+        self.compress_check.setChecked(bool(self.settings_store.value("encode_mp3", True)))
+        self.compress_check.toggled.connect(lambda checked: self.settings_store.setValue("encode_mp3", checked))
+        grid.addWidget(self.compress_check, 5, 0, 1, 2)
+
+        grid.addWidget(self._localized_label("MP3 比特率", "MP3 Bitrate"), 6, 0)
+        self.bitrate_combo = VisibleComboBox()
+        for bitrate in (128, 192, 256, 320):
+            self.bitrate_combo.addItem(f"{bitrate} kbps", bitrate)
+        bitrate_index = self.bitrate_combo.findData(int(self.settings_store.value("mp3_bitrate", 256)))
+        self.bitrate_combo.setCurrentIndex(max(0, bitrate_index))
+        self.bitrate_combo.currentIndexChanged.connect(
+            lambda _: self.settings_store.setValue("mp3_bitrate", self.bitrate_combo.currentData()))
+        grid.addWidget(self.bitrate_combo, 6, 1)
+
+        grid.addWidget(self._localized_label("MP3 采样率", "MP3 Sample Rate"), 7, 0)
+        self.sample_combo = VisibleComboBox()
+        for rate in (32000, 44100, 48000):
+            self.sample_combo.addItem(f"{rate:,} Hz", rate)
+        rate_index = self.sample_combo.findData(int(self.settings_store.value("mp3_sample_rate", 44100)))
+        self.sample_combo.setCurrentIndex(max(0, rate_index))
+        self.sample_combo.currentIndexChanged.connect(
+            lambda _: self.settings_store.setValue("mp3_sample_rate", self.sample_combo.currentData()))
+        grid.addWidget(self.sample_combo, 7, 1)
+
+        self.clear_cache_btn = FloatingButton(TXT("一键清理临时歌曲缓存", "Clear Temporary Song Cache"))
+        self.clear_cache_btn.setObjectName("chipButton")
+        self.clear_cache_btn.clicked.connect(self._clear_online_audio_cache)
+        grid.addWidget(self.clear_cache_btn, 8, 0, 1, 2)
+
         note = self._localized_label(
             "歌曲和个人偏好保存在项目下的 local 文件夹中。",
             "Music and preferences are stored in this project's local folder."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#787878; font-size:12px;")
-        grid.addWidget(note, 5, 0, 1, 2)
-        grid.setRowStretch(6, 1)
+        grid.addWidget(note, 9, 0, 1, 2)
+        grid.setRowStretch(10, 1)
         system.setWidget(host)
         return system
+
+    def _clear_online_audio_cache(self):
+        if self._saving_count:
+            return
+        self._selection_token += 1
+        self._purge_token = self._selection_token
+        self._pending_save = False
+        current_file = self.player.source().toLocalFile()
+        if current_file and Path(current_file).is_relative_to(CACHE_DIR / "siren" / "audio"):
+            self.player.stop()
+            self.player.setSource(QUrl())
+        target = CACHE_DIR / "siren" / "audio"
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        self.scan_status.setText(TXT("临时歌曲缓存已清理", "Temporary song cache cleared"))
 
     def _build_lyric_settings_view(self):
 
@@ -2547,6 +2662,8 @@ class MusicPage(QWidget):
         self._rebuild_playlist()
 
     def _rebuild_playlist(self):
+        scroll_y = self.playlist_scroll.verticalScrollBar().value() if hasattr(self, "playlist_scroll") else 0
+        self._cover_widgets = {}
         while self.playlist_layout.count() > 1:
             item = self.playlist_layout.takeAt(0)
             w = item.widget()
@@ -2562,19 +2679,7 @@ class MusicPage(QWidget):
         if query:
             visible = [(i, track) for i, track in visible if query in
                        (track["title"] + " " + track["artist"] + " " + track["album"]).casefold()]
-        remaining = len(visible) - self.online_limit if self.source_kind == "online" else 0
-        if self.source_kind == "online":
-            visible = visible[:self.online_limit]
-            for _, track in visible:
-                cid = track["cid"]
-                if track.get("cover_bytes") or not track.get("cover_url") or cid in self._cover_pending:
-                    continue
-                cover_path = ARTWORK_DIR / (cid + ".img")
-                if cover_path.exists():
-                    track["cover_bytes"] = cover_path.read_bytes()
-                else:
-                    self._cover_pending.add(cid)
-                    self._submit("cover:" + cid, siren.fetch_bytes, track["cover_url"], 5 * 1024 * 1024)
+        remaining = 0
 
         # Gather visible tracks by normalized album metadata.
         album_members = {}
@@ -2594,9 +2699,15 @@ class MusicPage(QWidget):
         # member determines where an album appears in the list.
         rendered_album_keys = set()
         shown = 0
+        rendered = 0
 
         for i, track in visible:
             album_key = self._album_key(track)
+            if album_key in rendered_album_keys:
+                continue
+            if self.source_kind == "online" and rendered >= self.online_limit:
+                remaining += 1
+                continue
 
             if album_key in grouped_keys:
                 if album_key in rendered_album_keys:
@@ -2613,6 +2724,7 @@ class MusicPage(QWidget):
 
                 # "First song" means the first song after album-track sorting.
                 first_index, first_track = members[0]
+                self._ensure_cover(first_track)
                 album_name = str(
                     first_track.get("album", "") or ""
                 ).strip()
@@ -2622,32 +2734,62 @@ class MusicPage(QWidget):
                     [member_track for _, member_track in members],
                     self._pixmap_for_track(first_track, 80),
                 )
+                header.set_expanded(album_key in self.album_expanded)
+                if first_track.get("online"):
+                    self._cover_widgets.setdefault(first_track["cid"], []).append((header.cover_label, 80, 12))
                 self.playlist_layout.insertWidget(
                     self.playlist_layout.count() - 1,
                     header
                 )
-
-                for member_index, member_track in members:
-                    row = MusicTrackRow(
-                        member_index,
-                        member_track,
-                        self._pixmap_for_track(member_track, 64)
-                    )
-                    row.setContentsMargins(10, 0, 0, 0)
-                    row.clicked.connect(self.select_track)
-                    row.favoriteToggled.connect(self._set_track_favorite)
-                    row.categoryRequested.connect(
-                        self._set_track_category_dialog
-                    )
-                    self.playlist_layout.insertWidget(
-                        self.playlist_layout.count() - 1,
-                        row
-                    )
-                    shown += 1
+                body = QWidget()
+                body.setMaximumHeight(0)
+                body_layout = QVBoxLayout(body)
+                body_layout.setContentsMargins(9, 0, 0, 0)
+                body_layout.setSpacing(2)
+                body.setVisible(False)
+                self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, body)
+                def toggle_group(_checked=False, key=album_key, widget=body, title=header, group=members):
+                    expanded = key not in self.album_expanded
+                    if expanded:
+                        self.album_expanded.add(key)
+                        if widget.layout().count() == 0:
+                            for member_index, member_track in group:
+                                self._ensure_cover(member_track)
+                                row = MusicTrackRow(member_index, member_track, self._pixmap_for_track(member_track, 64))
+                                row.clicked.connect(self.select_track)
+                                row.favoriteToggled.connect(self._set_track_favorite)
+                                row.categoryRequested.connect(self._set_track_category_dialog)
+                                widget.layout().addWidget(row)
+                                if member_track.get("online"):
+                                    self._cover_widgets.setdefault(member_track["cid"], []).append((row.cover_label, 64, 12))
+                        widget.setVisible(True)
+                        widget.setMaximumHeight(16777215)
+                        target_height = widget.layout().sizeHint().height()
+                        widget.setMaximumHeight(0)
+                    else:
+                        self.album_expanded.discard(key)
+                        target_height = 0
+                    title.set_expanded(expanded)
+                    animation = QPropertyAnimation(widget, b"maximumHeight", widget)
+                    animation.setDuration(220)
+                    animation.setEasingCurve(QEasingCurve.OutCubic)
+                    animation.setStartValue(widget.height())
+                    animation.setEndValue(target_height)
+                    if not expanded:
+                        animation.finished.connect(lambda: widget.setVisible(False))
+                    widget._height_animation = animation
+                    animation.start()
+                header.toggled.connect(toggle_group)
+                if album_key in self.album_expanded:
+                    self.album_expanded.discard(album_key)
+                    toggle_group()
+                shown += len(members)
+                rendered += 1
                 continue
 
             # Albumless songs and albums represented by only one visible track
             # remain normal standalone rows.
+            self._ensure_cover(track)
             row = MusicTrackRow(
                 i,
                 track,
@@ -2656,11 +2798,14 @@ class MusicPage(QWidget):
             row.clicked.connect(self.select_track)
             row.favoriteToggled.connect(self._set_track_favorite)
             row.categoryRequested.connect(self._set_track_category_dialog)
+            if track.get("online"):
+                self._cover_widgets.setdefault(track["cid"], []).append((row.cover_label, 64, 12))
             self.playlist_layout.insertWidget(
                 self.playlist_layout.count() - 1,
                 row
             )
             shown += 1
+            rendered += 1
 
         if shown == 0:
             empty = QLabel(
@@ -2684,10 +2829,32 @@ class MusicPage(QWidget):
         if ACTIVE_THEME == "day":
             for widget in self.playlist_host.findChildren(QWidget):
                 recolor_widget(widget)
+        if scroll_y:
+            QTimer.singleShot(0, lambda: self.playlist_scroll.verticalScrollBar().setValue(scroll_y))
 
     def _show_more_online(self):
-        self.online_limit += 90
+        self._more_scheduled = False
+        self.online_limit += 55
         self._rebuild_playlist()
+
+    def _ensure_cover(self, track):
+        if not track.get("online") or track.get("cover_bytes") or not track.get("cover_url"):
+            return
+        cid = track["cid"]
+        cover_path = ARTWORK_DIR / (cid + ".img")
+        if cover_path.exists():
+            track["cover_bytes"] = cover_path.read_bytes()
+        elif cid not in self._cover_pending:
+            self._cover_pending.add(cid)
+            self._submit("cover:" + cid, siren.fetch_bytes, track["cover_url"], 5 * 1024 * 1024)
+
+    def _maybe_load_more(self, value):
+        if self.source_kind != "online" or self._more_scheduled:
+            return
+        scrollbar = self.playlist_scroll.verticalScrollBar()
+        if scrollbar.maximum() > 0 and value >= scrollbar.maximum() - 180 and self.online_limit < len(self.tracks):
+            self._more_scheduled = True
+            QTimer.singleShot(100, self._show_more_online)
 
 
     def _sync_hero_favorite(self):
@@ -2713,6 +2880,8 @@ class MusicPage(QWidget):
         self._pending_save = False
         self.current_index = index
         track = self.tracks[index]
+        if track.get("online"):
+            self._request_credits(track)
         self.current_lyrics = track.get("lyrics", [])
         self.current_lyric_index = -1
         self.player.stop()
@@ -3206,7 +3375,7 @@ class MusicWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         language = LocalPreferences(SETTINGS_FILE).value("language", "zh")
-        self.setWindowTitle("Velia · Music Player" if language == "en" else "Velia · 音乐播放器")
+        self.setWindowTitle("Velia Music Player" if language == "en" else "Velia音乐播放器")
         self.resize(1380, 850)
         self.setMinimumSize(1070, 710)
         self.page = MusicPage(self)
@@ -3216,6 +3385,14 @@ class MusicWindow(QMainWindow):
     def closeEvent(self, event):
         self.page.desktop_lyrics.close()
         self.page.player.stop()
+        self.page.player.setSource(QUrl())
+        self.page.executor.shutdown(wait=False, cancel_futures=True)
+        self.page.media_executor.shutdown(wait=False, cancel_futures=True)
+        def clean_after_network():
+            self.page.executor.shutdown(wait=True)
+            self.page.media_executor.shutdown(wait=True)
+            shutil.rmtree(CACHE_DIR, ignore_errors=True)
+        threading.Thread(target=clean_after_network, name="velia-cache-cleanup", daemon=False).start()
         super().closeEvent(event)
 
 
