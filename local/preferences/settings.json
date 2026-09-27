@@ -1,0 +1,15 @@
+{
+  "font_family": "Microsoft YaHei UI",
+  "font_size": 30,
+  "font_weight": 700,
+  "text_color": "#ffffff",
+  "rainbow": true,
+  "background_enabled": false,
+  "background_color": "#000000",
+  "language": "zh",
+  "theme": "day",
+  "desktop_lyrics_position": {
+    "x": 277,
+    "y": 79
+  }
+}
