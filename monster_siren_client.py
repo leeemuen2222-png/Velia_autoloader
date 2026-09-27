@@ -6,6 +6,7 @@ No media is downloaded until a song is selected or explicitly saved.
 
 import argparse
 import html
+from html.parser import HTMLParser
 import json
 import io
 import re
@@ -128,38 +129,118 @@ def wiki_fallback(title):
     return results
 
 
-def prts_credits(title):
-    """Read a song's exact PRTS article linked from 音乐鉴赏.
+class _ArticleText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip = 0
 
-    The appreciation index itself lists titles, while individual pages list
-    release dates and production credits. Never infer a release year from
-    the game's timeline or a different song's article.
-    """
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        if not self.skip and tag in ("p", "h2", "h3", "h4", "li", "tr", "td", "th", "br", "div"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self.skip:
+            self.skip -= 1
+        if not self.skip and tag in ("p", "h2", "h3", "tr", "td"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+
+def _prts_article(title):
+    """Fetch one exact PRTS article; use parse HTML when TextExtracts is absent."""
+    base = "https://prts.wiki/api.php?"
+    fallback_url = "https://prts.wiki/w/" + urllib.parse.quote(title.replace(" ", "_"))
     query = urllib.parse.urlencode({"action": "query", "prop": "extracts|info",
-        "titles": title, "redirects": 1, "explaintext": 1, "exchars": 7000,
+        "titles": title, "redirects": 1, "explaintext": 1,
         "inprop": "url", "format": "json"})
+    normalize = lambda s: re.sub(r"[^\w]+", "", s).casefold()
     try:
-        data = json.loads(fetch_bytes("https://prts.wiki/api.php?" + query))
+        data = json.loads(fetch_bytes(base + query, 7 * 1024 * 1024))
         pages = (data.get("query") or {}).get("pages") or {}
-        normalize = lambda s: re.sub(r"[^\w]+", "", s).casefold()
-        page = next((v for v in pages.values()
-                     if "missing" not in v and normalize(v.get("title", "")) == normalize(title)), None)
-        if not page:
-            return {}
-        body = html.unescape(page.get("extract") or "")
-        head = re.split(r"\n\s*(?:歌词|曲目|相关内容|导航)\s*\n", body, maxsplit=1)[0][:4500]
-        year = re.search(r"(?:于|发行日期|发布时间|发售日期)[^\n]{0,35}?(20\d{2})年\d{1,2}月", head)
-        if not year:
-            year = re.search(r"(20\d{2})年\d{1,2}月\d{1,2}日[^\n]{0,12}(?:发行|发布)", head)
-        composer = re.search(r"(?:作曲|音乐制作|编曲)\s*[:：]\s*([^\n]{2,95})", head)
-        if composer:
-            credit = composer.group(1).strip().split("  ")[0].strip()
+        page = next((v for v in pages.values() if "missing" not in v
+                     and normalize(v.get("title", "")) == normalize(title)), None)
+        if page:
+            body = html.unescape(page.get("extract") or "")
+            if body and ("20" in body or "作曲" in body):
+                return body, page.get("fullurl") or fallback_url
+            query = urllib.parse.urlencode({"action": "parse", "page": page["title"],
+                                             "prop": "text", "format": "json"})
+            parsed = json.loads(fetch_bytes(base + query, 10 * 1024 * 1024))
+            markup = parsed.get("parse", {}).get("text", {}).get("*", "")
         else:
-            credit = ""
-        return {"year": year.group(1) if year else "", "composer": credit,
-                "url": page.get("fullurl") or "https://prts.wiki/w/" + urllib.parse.quote(title.replace(" ", "_"))}
+            markup = ""
     except Exception:
-        return {}
+        markup = ""
+    if not markup:
+        markup = fetch_bytes(fallback_url, 10 * 1024 * 1024).decode("utf-8", errors="replace")
+        heading = re.search(r"<h1[^>]*>(.*?)</h1>", markup, re.I | re.S)
+        if not heading:
+            return None
+        parser = _ArticleText()
+        parser.feed(heading.group(1))
+        if normalize(html.unescape("".join(parser.parts))) != normalize(title):
+            return None
+    parser = _ArticleText()
+    parser.feed(markup)
+    body = html.unescape("".join(parser.parts))
+    return body, fallback_url
+
+
+def prts_credits(title, album=""):
+    """Classify from exact PRTS song/album articles; keep unknown as other."""
+    kind = "ost" if re.search(r"(?:OST|原声带|Original Soundtrack)\s*$", album, re.I) else "other"
+    if re.search(r"(?:\bOP\b|片头曲)\s*$", title, re.I):
+        kind = "op"
+    if re.search(r"(?:\bED\b|片尾曲)\s*$", title, re.I):
+        kind = "ed"
+    result = {"year": "", "composer": "", "kind": kind, "url": ""}
+    for name in dict.fromkeys((title, album)):
+        if not name:
+            continue
+        try:
+            article = _prts_article(name)
+        except Exception:
+            continue
+        if not article:
+            continue
+        body, url = article
+        lead = body.find("《" + name + "》")
+        if lead >= 0:
+            body = body[lead:]
+        head = re.split(r"\n\s*(?:歌词|曲目|导航菜单)\s*\n", body, maxsplit=1)[0][:6000]
+        result["url"] = result["url"] or url
+        year = re.search(r"(?:于|发行日期|发布时间|发售日期)[^\n]{0,45}?(20\d{2})年\s*\d{1,2}月", head)
+        if not year:
+            year = re.search(r"(20\d{2})年\s*\d{1,2}月\s*\d{1,2}日[^\n]{0,18}(?:发行|发布)", head)
+        if not year:
+            year = re.search(r"(?:发布时间|发行日期)\s*[:：\s]*(20\d{2})[-年/]", head)
+        if year and not result["year"]:
+            result["year"] = year.group(1)
+        if name == title:
+            composer = re.search(r"(?:作曲|音乐制作|编曲)\s*[:：]\s*([^\n]{2,95})", head)
+            if composer:
+                result["composer"] = composer.group(1).strip().split("  ")[0].strip()
+            if re.search(r"(?:同名|单曲)\s*EP|\bEP\s*专辑", head, re.I) and kind == "other":
+                kind = "ep"
+            if re.search(r"(?:作为|是|用作)[^\n]{0,40}(?:片头曲|主题歌\s*\[?OP\]?)", head):
+                kind = "op"
+            if re.search(r"(?:作为|是|用作)[^\n]{0,40}(?:片尾曲|主题歌\s*\[?ED\]?)", head):
+                kind = "ed"
+        elif kind == "other":
+            if re.search(r"(?:OST|原声带|Original Soundtrack)\s*$", name, re.I):
+                kind = "ost"
+            elif re.search(r"(?:同名|单曲)\s*EP|\bEP\s*专辑", head, re.I):
+                kind = "ep"
+        if result["year"] and result["composer"] and kind != "other":
+            break
+    result["kind"] = kind
+    return result
 
 
 def ffmpeg_executable():
@@ -172,12 +253,15 @@ def ffmpeg_executable():
 
 def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
                 bitrate=256, sample_rate=44100):
-    """Create the user's ep_NAME/{ep_NAME.mp3,png,lrc} bundle atomically."""
+    """Create a classified NAME/{NAME.mp3,png,lrc} bundle atomically."""
     audio_path = Path(audio_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", track["title"]).strip(" ._")[:85] or track["cid"]
-    stem = "ep_" + safe.replace(" ", "_")
+    kind = str(track.get("kind", "other")).lower()
+    if kind not in ("ep", "ost", "op", "ed"):
+        kind = "music"
+    stem = kind + "_" + safe.replace(" ", "_")
     destination = output_dir / (stem + ".zip")
     stage = Path(tempfile.mkdtemp(prefix="velia_ep_"))
     temporary_zip = output_dir / ("." + stem + "_" + uuid.uuid4().hex[:8] + ".part")
@@ -193,7 +277,7 @@ def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
                        "-metadata", "title=" + track["title"],
                        "-metadata", "artist=" + track.get("artist", ""),
                        "-metadata", "album=" + track.get("album", ""),
-                       "-metadata", "date=" + track.get("year", ""),
+                       "-metadata", "date=" + str(track.get("year", "")),
                        str(target_audio)]
             proc = subprocess.run(command, capture_output=True, timeout=300,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -201,6 +285,26 @@ def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
                 raise RuntimeError(proc.stderr.decode("utf-8", errors="replace")[-350:] or "MP3 encoding failed")
         else:
             shutil.copy2(audio_path, target_audio)
+        if target_audio.suffix.lower() == ".mp3":
+            from mutagen.id3 import APIC, ID3, TCON, TCOM, TALB, TIT2, TPE1, TPE2, TRCK, TXXX, TYER
+            try:
+                tags = ID3(str(target_audio))
+            except Exception:
+                tags = ID3()
+            for frame in ("TIT2", "TPE1", "TPE2", "TALB", "TRCK", "TYER", "TDRC", "TCON", "TCOM", "APIC", "TXXX:SOURCE"):
+                tags.delall(frame)
+            tags.add(TIT2(encoding=3, text=track["title"]))
+            tags.add(TPE1(encoding=3, text=track.get("artist") or ""))
+            tags.add(TPE2(encoding=3, text=track.get("artist") or ""))
+            tags.add(TALB(encoding=3, text=track.get("album") or ""))
+            if str(track.get("track") or "").isdigit() and int(track["track"]) > 0:
+                tags.add(TRCK(encoding=3, text=str(track["track"])))
+            if str(track.get("year") or "").isdigit():
+                tags.add(TYER(encoding=3, text=str(track["year"])))
+            tags.add(TCON(encoding=3, text=kind.upper()))
+            if track.get("composer"):
+                tags.add(TCOM(encoding=3, text=track["composer"]))
+            tags.add(TXXX(encoding=3, desc="SOURCE", text=track.get("credits_url") or ROOT))
         if lyric_path and Path(lyric_path).is_file():
             shutil.copy2(lyric_path, stage / (stem + ".lrc"))
         else:
@@ -215,6 +319,10 @@ def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
             image = QImage(512, 512, QImage.Format_ARGB32)
             image.fill(QColor("#222630"))
         image.save(str(stage / (stem + ".png")), "PNG")
+        if target_audio.suffix.lower() == ".mp3":
+            tags.add(APIC(encoding=3, mime="image/png", type=3, desc="Cover",
+                          data=(stage / (stem + ".png")).read_bytes()))
+            tags.save(str(target_audio), v2_version=3)
         with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
             for file in sorted(stage.iterdir()):
                 if file.is_file() and file != temporary_zip:

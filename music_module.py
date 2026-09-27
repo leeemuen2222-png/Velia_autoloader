@@ -744,7 +744,90 @@ class DelayedToolTipButton(FloatingButton):
             )
 
 
-class MusicTrackRow(QFrame):
+class TiltCoverLabel(QLabel):
+    """A small perspective tilt that follows the parent card's hover progress."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.depth = 0.0
+
+    def set_depth(self, depth):
+        self.depth = float(depth)
+        self.update()
+
+    def paintEvent(self, event):
+        pixmap = self.pixmap()
+        if not pixmap or pixmap.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.translate(self.width() / 2 + self.depth * 1.5, self.height() / 2 - self.depth * 1.5)
+        painter.shear(-0.075 * self.depth, 0.025 * self.depth)
+        size = min(self.width(), self.height()) - 3
+        rect = QRectF(-size / 2, -size / 2, size, size)
+        clip = QPainterPath()
+        clip.addRoundedRect(rect, 11, 11)
+        painter.setClipPath(clip)
+        painter.drawPixmap(rect.toRect(), pixmap)
+
+
+class HoverDepthCard(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._depth = 0.0
+        self._lift_animation = QPropertyAnimation(self, b"cardDepth", self)
+        self._lift_animation.setDuration(190)
+        self._lift_animation.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _get_depth(self):
+        return self._depth
+
+    def _set_depth(self, value):
+        self._depth = float(value)
+        if hasattr(self, "cover_label"):
+            self.cover_label.set_depth(self._depth)
+        self.update()
+
+    cardDepth = Property(float, _get_depth, _set_depth)
+
+    def enterEvent(self, event):
+        self._lift_animation.stop()
+        self._lift_animation.setStartValue(self._depth)
+        self._lift_animation.setEndValue(1.0)
+        self._lift_animation.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._lift_animation.stop()
+        self._lift_animation.setStartValue(self._depth)
+        self._lift_animation.setEndValue(0.0)
+        self._lift_animation.start()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        x, y = 2, 2 - self._depth
+        w, h = self.width() - 5, self.height() - 7
+        if w <= 0 or h <= 0:
+            return
+        day = ACTIVE_THEME == "day"
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(56, 73, 103, int(17 + 25 * self._depth)) if day
+                         else QColor(0, 0, 0, int(45 + 55 * self._depth)))
+        painter.drawRoundedRect(QRectF(x + 1 + self._depth * 2, y + 4 + self._depth * 3, w, h), 17, 17)
+        painter.setBrush(QColor("#f8faff" if day else "#11161e"))
+        painter.setPen(QPen(QColor(185, 201, 224, int(85 + 100 * self._depth)) if day
+                            else QColor(105, 128, 164, int(35 + 96 * self._depth)), 1))
+        painter.drawRoundedRect(QRectF(x, y, w, h), 17, 17)
+        if self._depth > 0:
+            painter.setPen(QPen(QColor(255, 255, 255, int(110 * self._depth)) if day
+                                else QColor(198, 211, 238, int(84 * self._depth)), 1))
+            painter.drawLine(QPointF(x + 17, y + 2), QPointF(x + w - 17, y + 2))
+
+
+class MusicTrackRow(HoverDepthCard):
     clicked = Signal(int)
     favoriteToggled = Signal(int, bool)
     categoryRequested = Signal(int)
@@ -757,21 +840,12 @@ class MusicTrackRow(QFrame):
         self.setObjectName("musicTrackRow")
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
-        self.setStyleSheet("""
-            QFrame#musicTrackRow {
-                background: transparent;
-                border: 0;
-                border-radius: 16px;
-            }
-            QFrame#musicTrackRow:hover {
-                background: rgba(255,255,255,0.075);
-            }
-        """)
+        self.setStyleSheet("QFrame#musicTrackRow { background:transparent; border:0; }")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 9, 10, 9)
         lay.setSpacing(10)
 
-        cover = QLabel()
+        cover = TiltCoverLabel()
         self.cover_label = cover
         cover.setFixedSize(48, 48)
         cover.setPixmap(_rounded_cover(cover_pixmap, 48, 12))
@@ -782,8 +856,10 @@ class MusicTrackRow(QFrame):
         words.setSpacing(1)
         title = QLabel(track["title"])
         title.setStyleSheet("font-size: 14px; font-weight: 650; color: #ededed;")
+        self.title_label = title
         artist = QLabel(track["artist"])
         artist.setStyleSheet("font-size: 12px; color: #919191;")
+        self.artist_label = artist
         title.setTextInteractionFlags(Qt.NoTextInteraction)
         artist.setTextInteractionFlags(Qt.NoTextInteraction)
         words.addWidget(title)
@@ -799,6 +875,18 @@ class MusicTrackRow(QFrame):
         self.favorite_btn.clicked.connect(self._favorite_clicked)
         self._sync_star()
         lay.addWidget(self.favorite_btn)
+        self.sync_download_state()
+
+    def sync_download_state(self):
+        saved = self.track.get("saved_locally", False)
+        ready = saved or self.track.get("downloaded", False) or not self.track.get("online")
+        self.title_label.setStyleSheet("font-size:14px; font-weight:650; color:" +
+                                       ("#ededed" if ready else "#919191") + ";")
+        if ACTIVE_THEME == "day":
+            recolor_widget(self.title_label)
+        self.title_label.setToolTip(TXT("已保存到本地", "Saved locally") if saved else "")
+        self.setProperty("savedLocally", saved)
+        self.update()
 
     def _sync_star(self):
         self.favorite_btn.update()
@@ -825,7 +913,7 @@ class MusicTrackRow(QFrame):
         super().mousePressEvent(event)
 
 
-class MusicAlbumHeader(QFrame):
+class MusicAlbumHeader(HoverDepthCard):
     """Visual header for a group of tracks sharing the same album metadata."""
     toggled = Signal()
 
@@ -833,20 +921,13 @@ class MusicAlbumHeader(QFrame):
         super().__init__(parent)
         self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("musicAlbumHeader")
-        self.setStyleSheet("""
-            QFrame#musicAlbumHeader {
-                background: rgba(255,255,255,0.030);
-                border: 1px solid rgba(255,255,255,0.055);
-                border-radius: 18px;
-                margin-top: 8px;
-            }
-        """)
+        self.setStyleSheet("QFrame#musicAlbumHeader { background:transparent; border:0; }")
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 10, 12, 10)
         lay.setSpacing(10)
 
-        cover = QLabel()
+        cover = TiltCoverLabel()
         self.cover_label = cover
         cover.setFixedSize(56, 56)
         cover.setPixmap(
@@ -1092,15 +1173,24 @@ class MusicPage(QWidget):
         self.network.finished.connect(self._network_done)
         self.executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="velia-artwork")
         self.media_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="velia-audio")
+        self.metadata_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="velia-metadata")
         self._selection_token = 0
         self._purge_token = -1
         self._pending_save = False
+        self._pending_metadata_save = None
         self._saving_count = 0
         self._cover_pending = set()
         self._credits_pending = set()
         self.album_expanded = set()
         self._cover_widgets = {}
         self.prts_cache_file = PREFERENCE_DIR / "prts_credits.json"
+        self.saved_index_file = PREFERENCE_DIR / "siren_saved.json"
+        try:
+            self.saved_packages = json.loads(self.saved_index_file.read_text(encoding="utf-8"))
+            if not isinstance(self.saved_packages, dict):
+                self.saved_packages = {}
+        except (OSError, ValueError):
+            self.saved_packages = {}
         try:
             self.prts_cache = json.loads(self.prts_cache_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1143,8 +1233,9 @@ class MusicPage(QWidget):
         QTimer.singleShot(100, self._load_online_catalogue)
 
     def _submit(self, kind, fn, *args):
-        priority = kind.startswith(("audio:", "catalogue", "wiki:"))
-        future = (self.media_executor if priority else self.executor).submit(fn, *args)
+        queue = (self.media_executor if kind.startswith(("audio:", "save:")) else
+                 self.metadata_executor if kind.startswith(("credits:", "catalogue", "wiki:")) else self.executor)
+        future = queue.submit(fn, *args)
         def deliver(done):
             try:
                 self.network.finished.emit(kind, done.result(), None)
@@ -1181,6 +1272,9 @@ class MusicPage(QWidget):
                 "cover_url": s.get("cover_url", ""), "cover_bytes": None,
                 "cover_desc": TXT("塞壬唱片", "Monster Siren"), "track": "", "year": "",
                 "duration_ms": 0, "lyrics": [],
+                "kind": "ost" if re.search(r"OST\s*$", s.get("album", ""), re.I) else "other",
+                "saved_locally": Path(self.saved_packages.get(cid, "")).is_file(),
+                "downloaded": False,
                 "favorite": bool(self.library_state.get("favorites", {}).get(key)),
                 "category": str(self.library_state.get("categories", {}).get(key, "")),
             })
@@ -1230,6 +1324,10 @@ class MusicPage(QWidget):
                 self.scan_status.setText(TXT("下载失败：", "Download failed: ") + error[:120])
                 return
             track = self.tracks[self.current_index]
+            track["downloaded"] = True
+            for row in self.playlist_host.findChildren(MusicTrackRow):
+                if row.track is track:
+                    row.sync_download_state()
             path, detail, album, lyrics = value
             track["lyrics"] = lyrics
             track["track"] = str(next((i for i, x in enumerate(album.get("songs", [])) if str(x.get("cid")) == cid), -1) + 1) if album else ""
@@ -1255,20 +1353,36 @@ class MusicPage(QWidget):
         elif kind.startswith("credits:"):
             cid = kind.split(":", 1)[1]
             self._credits_pending.discard(cid)
-            self.prts_cache[cid] = value if isinstance(value, dict) else {}
-            try:
-                _write_json(self.prts_cache_file, self.prts_cache)
-            except OSError:
-                pass
+            if not error and isinstance(value, dict) and any(value.get(x) for x in ("year", "composer", "url")):
+                self.prts_cache[cid] = value
+                try:
+                    _write_json(self.prts_cache_file, self.prts_cache)
+                except OSError:
+                    pass
             for track in self.online_tracks:
                 if track["cid"] == cid:
-                    self._apply_credits(track, self.prts_cache[cid])
+                    self._apply_credits(track, value if isinstance(value, dict) else {})
                     break
+            if self._pending_metadata_save == cid:
+                self._pending_metadata_save = None
+                if 0 <= self.current_index < len(self.tracks) and self.tracks[self.current_index].get("cid") == cid:
+                    self._save_online_track()
         elif kind.startswith("save:"):
             self._saving_count = max(0, self._saving_count - 1)
             self.clear_cache_btn.setEnabled(self._saving_count == 0)
             self.refresh_btn.setEnabled(self._saving_count == 0)
             self.save_online_btn.setEnabled(True)
+            if not error and value:
+                cid = kind.split(":", 1)[1]
+                self.saved_packages[cid] = str(value)
+                _write_json(self.saved_index_file, self.saved_packages)
+                for track in self.online_tracks:
+                    if track["cid"] == cid:
+                        track["saved_locally"] = True
+                        break
+                for row in self.playlist_host.findChildren(MusicTrackRow):
+                    if row.track.get("cid") == cid:
+                        row.sync_download_state()
             self.scan_status.setText((TXT("保存失败：", "Save failed: ") + error[:150]) if error else
                                      TXT(f"已保存：{value.name}", f"Saved: {value.name}"))
 
@@ -1277,16 +1391,18 @@ class MusicPage(QWidget):
             track["year"] = credits.get("year") or track.get("year", "")
             track["composer"] = credits.get("composer", "")
             track["credits_url"] = credits.get("url", "")
+            track["kind"] = credits.get("kind") or track.get("kind", "other")
             if self.current_index >= 0 and self.tracks[self.current_index] is track:
                 self._show_track_details(track)
 
     def _request_credits(self, track):
         cid = track["cid"]
-        if cid in self.prts_cache:
+        cached = self.prts_cache.get(cid, {})
+        if any(cached.get(x) for x in ("year", "composer", "url")):
             self._apply_credits(track, self.prts_cache[cid])
-        elif cid not in self._credits_pending:
+        if (not cached.get("year") or not cached.get("kind")) and cid not in self._credits_pending:
             self._credits_pending.add(cid)
-            self._submit("credits:" + cid, siren.prts_credits, track["title"])
+            self._submit("credits:" + cid, siren.prts_credits, track["title"], track["album"])
 
     def _online_job(self, track):
         cid = track["cid"]
@@ -1341,6 +1457,10 @@ class MusicPage(QWidget):
                 self.select_track(self.current_index)
             self._pending_save = True
             self.scan_status.setText(TXT("下载完成后保存到本地…", "Saving after download…"))
+            return
+        if track["cid"] in self._credits_pending:
+            self._pending_metadata_save = track["cid"]
+            self.scan_status.setText(TXT("等待 PRTS 发行资料…", "Waiting for PRTS release details…"))
             return
         self._pending_save = False
         self._saving_count += 1
@@ -2760,6 +2880,9 @@ class MusicPage(QWidget):
                                 row.favoriteToggled.connect(self._set_track_favorite)
                                 row.categoryRequested.connect(self._set_track_category_dialog)
                                 widget.layout().addWidget(row)
+                                if ACTIVE_THEME == "day":
+                                    for visual in (row, *row.findChildren(QWidget)):
+                                        recolor_widget(visual)
                                 if member_track.get("online"):
                                     self._cover_widgets.setdefault(member_track["cid"], []).append((row.cover_label, 64, 12))
                         widget.setVisible(True)
@@ -2878,6 +3001,7 @@ class MusicPage(QWidget):
             return
         self._selection_token += 1
         self._pending_save = False
+        self._pending_metadata_save = None
         self.current_index = index
         track = self.tracks[index]
         if track.get("online"):
@@ -3388,9 +3512,11 @@ class MusicWindow(QMainWindow):
         self.page.player.setSource(QUrl())
         self.page.executor.shutdown(wait=False, cancel_futures=True)
         self.page.media_executor.shutdown(wait=False, cancel_futures=True)
+        self.page.metadata_executor.shutdown(wait=False, cancel_futures=True)
         def clean_after_network():
             self.page.executor.shutdown(wait=True)
             self.page.media_executor.shutdown(wait=True)
+            self.page.metadata_executor.shutdown(wait=True)
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
         threading.Thread(target=clean_after_network, name="velia-cache-cleanup", daemon=False).start()
         super().closeEvent(event)
