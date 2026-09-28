@@ -18,7 +18,7 @@ from pathlib import Path
 import monster_siren_client as siren
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Property, QPropertyAnimation, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPainterPath, QPalette, QPen, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QColorDialog, QComboBox,
@@ -1061,7 +1061,8 @@ class DesktopLyricsWindow(QWidget):
             bg_rgba = "rgba(0,0,0,145)" if self.editing else "rgba(0,0,0,0)"
 
         self.label.setStyleSheet(
-            f"color:{color}; background:{bg_rgba}; border-radius:18px; padding:8px 16px;"
+            f"color:{color}; background:{bg_rgba}; border-radius:18px; padding:8px 16px; "
+            f"font-family:'{font.family()}'; font-size:{font.pointSize()}pt; font-weight:{font.weight()};"
             + ("border:1px solid #92a5d2;" if self.editing else "border:0;")
         )
 
@@ -1133,7 +1134,18 @@ class DesktopLyricsWindow(QWidget):
             return
         geo = screen.availableGeometry()
         width = max(520, int(geo.width() * 0.72))
-        height = 92
+        # Account for wrapped lyrics, padding and window margins at the selected
+        # point size. A fixed 92 px window clipped large fonts and hid the change.
+        available_text_width = max(100, width - 84)
+        display_font = QFont(self.settings.get("font_family", QApplication.font().family()))
+        display_font.setPointSize(int(self.settings.get("font_size", 30)))
+        display_font.setWeight(QFont.Weight(int(self.settings.get("font_weight", 700))))
+        metrics = QFontMetrics(display_font)
+        text = self.label.text() or " "
+        text_height = metrics.boundingRect(
+            0, 0, available_text_width, 10000, Qt.TextWordWrap | Qt.AlignCenter, text
+        ).height()
+        height = min(geo.height(), max(92, text_height + 56))
         self.resize(width, height)
         if saved:
             x = max(geo.x(), min(x, geo.right() - width + 1))
