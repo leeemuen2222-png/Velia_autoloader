@@ -1614,10 +1614,17 @@ class MusicPage(QWidget):
     def _track_key(self, path):
         if isinstance(path, str) and path.startswith("siren/"):
             return path
+        resolved = Path(path).resolve()
+        for extracted, archive_key in getattr(self, "archive_roots", {}).items():
+            try:
+                inside = resolved.relative_to(extracted)
+                return "archive:" + archive_key + "!/" + inside.as_posix()
+            except ValueError:
+                continue
         try:
-            return str(Path(path).resolve().relative_to(self.library_dir.resolve())).replace("\\", "/")
+            return str(resolved.relative_to(self.library_dir.resolve())).replace("\\", "/")
         except Exception:
-            return str(Path(path).resolve()).replace("\\", "/")
+            return str(resolved).replace("\\", "/")
 
     def _load_library_state(self):
         try:
@@ -2602,6 +2609,7 @@ class MusicPage(QWidget):
 
     def _extract_archives_recursive(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.archive_roots = {}
         queue = [
             p for p in self.library_dir.rglob("*")
             if p.is_file() and p.suffix.lower() == ".zip" and self.cache_dir not in p.parents
@@ -2621,6 +2629,18 @@ class MusicPage(QWidget):
             seen.add(digest)
 
             out = self.cache_dir / digest
+            try:
+                archive_key = zp.resolve().relative_to(self.library_dir.resolve()).as_posix()
+            except ValueError:
+                archive_key = None
+                for parent, source in self.archive_roots.items():
+                    try:
+                        archive_key = source + "!/" + zp.resolve().relative_to(parent).as_posix()
+                        break
+                    except ValueError:
+                        continue
+                if archive_key is None:
+                    archive_key = zp.name
             marker = out / ".source_signature"
             needs_extract = True
             if marker.exists():
@@ -2637,6 +2657,8 @@ class MusicPage(QWidget):
                     marker.write_text(signature, encoding="utf-8")
                 except Exception:
                     continue
+
+            self.archive_roots[out.resolve()] = archive_key
 
             for nested in out.rglob("*.zip"):
                 queue.append(nested)
@@ -2663,6 +2685,10 @@ class MusicPage(QWidget):
         self._extract_archives_recursive()
 
         all_files = [p for p in self.library_dir.rglob("*") if p.is_file()]
+        # ZIP files are kept in local/music; their playable contents live in
+        # disposable extraction directories under local/cache.
+        for extracted_root in self.archive_roots:
+            all_files.extend(p for p in extracted_root.rglob("*") if p.is_file())
         lyric_files = [p for p in all_files if p.suffix.lower() in LYRIC_EXTENSIONS]
         audio_files = [p for p in all_files if p.suffix.lower() in AUDIO_EXTENSIONS]
 
@@ -2683,8 +2709,9 @@ class MusicPage(QWidget):
                             info[field] = stored.get(field) or info.get(field, "")
                 except (OSError, ValueError):
                     pass
-            cover_file = path.with_suffix(".jpg")
-            if cover_file.is_file():
+            cover_file = next((path.with_suffix(ext) for ext in (".png", ".jpg", ".jpeg")
+                               if path.with_suffix(ext).is_file()), None)
+            if cover_file:
                 try:
                     info["cover_bytes"] = cover_file.read_bytes()
                     info["cover_desc"] = TXT("本地封面", "Local cover")
