@@ -14,6 +14,7 @@ import threading
 import wave
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 import monster_siren_client as siren
 
@@ -1156,6 +1157,36 @@ class DesktopLyricsWindow(QWidget):
         self.move(x, y)
 
 
+class HomeArtworkPanel(QFrame):
+    """Subtle placeholder thumbnail behind the editorial music cards."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setOpacity(0.25)
+        painter.setBrush(QColor('#b0c0d4' if ACTIVE_THEME == 'day' else '#63728d'))
+        painter.setPen(Qt.NoPen)
+        w, h = self.width(), self.height()
+        painter.drawRoundedRect(max(0, w - 260), 22, 224, max(20, h - 44), 16, 16)
+        painter.setOpacity(0.58)
+        painter.setPen(QColor('#435570' if ACTIVE_THEME == 'day' else '#cad1dd'))
+        painter.drawText(max(0, w - 248), 25, 198, max(20, h - 50),
+                         Qt.AlignCenter | Qt.TextWordWrap,
+                         TXT('背景缩略图\n待添加', 'Background thumbnail\nplaceholder'))
+
+
+class HomeLibraryBanner(QFrame):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class MusicPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1241,6 +1272,11 @@ class MusicPage(QWidget):
         self._build_ui()
         self._load_customization()
         self._apply_theme()
+        self._daily_date = date.today().isoformat()
+        self.daily_timer = QTimer(self)
+        self.daily_timer.setInterval(60 * 1000)
+        self.daily_timer.timeout.connect(self._daily_midnight_check)
+        self.daily_timer.start()
         QTimer.singleShot(0, self.reload_library)
         QTimer.singleShot(100, self._load_online_catalogue)
 
@@ -1298,8 +1334,18 @@ class MusicPage(QWidget):
             if self.tracks:
                 target = next((i for i, t in enumerate(self.tracks) if t["cid"] == previously), 0)
                 self.select_track(target, autoplay=False)
+        self._refresh_daily_song()
 
     def _network_done(self, kind, value, error):
+        if kind.startswith('daily_intro:'):
+            cid = kind.split(':', 1)[1]
+            if not error and isinstance(value, dict):
+                track = next((t for t in self.online_tracks if t['cid'] == cid), None)
+                if track:
+                    track['intro'] = value.get('intro', '')
+                    if cid == getattr(self, 'home_daily_cid', None):
+                        self._refresh_daily_song()
+            return
         if kind == "catalogue":
             if error:
                 if not self.online_tracks:
@@ -1322,6 +1368,9 @@ class MusicPage(QWidget):
                         break
                 for label, size, radius in self._cover_widgets.get(cid, []):
                     label.setPixmap(_rounded_cover(self._pixmap_for_track(track, size), size, radius))
+                if cid == getattr(self, 'home_daily_cid', None):
+                    self.home_daily_cover.setText('')
+                    self.home_daily_cover.setPixmap(_rounded_cover(self._pixmap_for_track(track, 144), 144, 17))
         elif kind.startswith("audio:"):
             _, token, cid = kind.split(":")
             if int(token) <= self._purge_token:
@@ -1451,6 +1500,7 @@ class MusicPage(QWidget):
         self.current_index = -1
         self.online_limit = 55
         self._rebuild_playlist()
+        self._refresh_daily_song()
         self.scan_status.setText(TXT(f"已列出 {len(self.tracks)} 首歌曲", f"{len(self.tracks)} tracks available"))
         if self.tracks:
             self.select_track(0, autoplay=False)
@@ -1509,7 +1559,16 @@ class MusicPage(QWidget):
             return
         APP_SETTINGS["language"] = language
         self.settings_store.setValue("language", language)
-
+        self.home_btn.setText(TXT('主页', 'Home'))
+        self.home_msr_title.setText(TXT('前往明日方舟音乐库', 'Explore Monster Siren'))
+        self.home_msr_note.setText(TXT('塞壬唱片 · 在线曲目与本地音乐', 'Monster Siren · online and local music'))
+        self.home_msr_button.setText(TXT('进入音乐库  ↗', 'Enter Library  ↗'))
+        self.home_daily_heading.setText(TXT('今日舟乐推荐', 'Today’s Arknights Track'))
+        self.home_daily_play.setText(TXT('播放今日推荐  ▶', 'Play Today’s Pick  ▶'))
+        self.home_news_heading.setText(TXT('每日药闻', 'Daily Pharmaceutical News'))
+        self.home_liked_heading.setText(TXT('22N7O 喜欢听的', '22N7O’s Favorites'))
+        self.home_guide.setText(TXT('打开使用指南', 'Open User Guide'))
+        self._refresh_daily_song()
         for label, zh, en in self._localized_labels:
             label.setText(TXT(zh, en))
         detail_names = {
@@ -1598,6 +1657,24 @@ class MusicPage(QWidget):
             if isinstance(widget, (RoundedStarButton, FolderAddButton,
                                    VisibleComboBox, VisibleCheckBox, VisibleFontComboBox)):
                 widget.update()
+        day = ACTIVE_THEME == 'day'
+        for card in self.findChildren(QFrame, 'homePanel'):
+            card.setStyleSheet('QFrame#homePanel { background:%s; border:1px solid %s; border-radius:24px; }' %
+                               (('#ffffff', '#c7d2df') if day else ('#15181f', '#303742')))
+        for banner in self.findChildren(QFrame, 'homeBanner'):
+            banner.setStyleSheet('QFrame#homeBanner { background:%s; border:1px solid %s; border-radius:27px; }' %
+                                 (('#e6edf6', '#bac8d9') if day else ('#202836', '#475369')))
+        self.home_msr_note.setStyleSheet('color:%s; background:transparent; border:0;' %
+                                         ('#455a74' if day else '#afb9cc'))
+        for holder in self.findChildren(QLabel, 'homeThumbnail'):
+            holder.setStyleSheet('QLabel#homeThumbnail { background:%s; border:1px dashed %s; border-radius:17px; color:%s; }' %
+                                 (('#d8e2ef', '#8699af', '#455a74') if day else
+                                  ('#303a4d', '#69758a', '#c6cfdb')))
+        for holder in self.findChildren(QLabel, 'homeLikedCover'):
+            holder.setStyleSheet('QLabel#homeLikedCover { background:%s; border:1px dashed %s; border-radius:12px; }' %
+                                 (('#d8e2ef', '#8699af') if day else ('#303a4d', '#69758a')))
+        self.home_daily_cover.setStyleSheet('background:%s; border:1px dashed %s; border-radius:17px;' %
+                                            (('#d8e2ef', '#8699af') if day else ('#303a4d', '#69758a')))
         self.setStyleSheet("QWidget#root { background: #f3f5f8; }" if ACTIVE_THEME == "day"
                            else "QWidget#root { background: #070707; }")
         self.update()
@@ -2003,6 +2080,203 @@ class MusicPage(QWidget):
         root.addWidget(self.main_stack, 1)
         self.main_stack.addWidget(self._build_player_view())
         self.main_stack.addWidget(self._build_settings_view())
+        self.main_stack.addWidget(self._build_home_view())
+        self.home_btn = FloatingButton(TXT("主页", "Home"))
+        self.home_btn.clicked.connect(lambda: self.main_stack.setCurrentIndex(2))
+        top.insertWidget(1, self.home_btn)
+        self.main_stack.setCurrentIndex(2)
+
+    def _home_panel(self, title, artwork=False):
+        panel = HomeArtworkPanel() if artwork else QFrame()
+        panel.setObjectName('homePanel')
+        panel.setStyleSheet(
+            'QFrame#homePanel { background:#15181f; border:1px solid #303742; border-radius:24px; }')
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(25, 20, 25, 20)
+        layout.setSpacing(11)
+        heading = QLabel(title)
+        heading.setStyleSheet('font-size:18px; font-weight:700; border:0; background:transparent;')
+        layout.addWidget(heading)
+        return panel, layout, heading
+
+    def _build_home_view(self):
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        page.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(32, 24, 32, 30)
+        layout.setSpacing(17)
+        heading = self._localized_label('欢迎来到 Velia', 'Welcome to Velia')
+        heading.setStyleSheet('font-size:29px; font-weight:700;')
+        layout.addWidget(heading)
+
+        banner = HomeLibraryBanner()
+        banner.setObjectName('homeBanner')
+        banner.setCursor(Qt.PointingHandCursor)
+        banner.clicked.connect(lambda: self.main_stack.setCurrentIndex(0))
+        banner.setMinimumHeight(195)
+        banner.setStyleSheet(
+            'QFrame#homeBanner { background:#202836; border:1px solid #475369; border-radius:27px; }')
+        banner_layout = QHBoxLayout(banner)
+        banner_layout.setContentsMargins(29, 21, 25, 21)
+        banner_text = QVBoxLayout()
+        self.home_msr_title = QLabel(TXT('前往明日方舟音乐库', 'Explore Monster Siren'))
+        self.home_msr_title.setStyleSheet('font-size:24px; font-weight:700; background:transparent; border:0;')
+        banner_text.addWidget(self.home_msr_title)
+        self.home_msr_note = QLabel(TXT('塞壬唱片 · 在线曲目与本地音乐',
+                                       'Monster Siren · online and local music'))
+        self.home_msr_note.setStyleSheet('color:#afb9cc; background:transparent; border:0;')
+        banner_text.addWidget(self.home_msr_note)
+        banner_text.addStretch()
+        self.home_msr_button = FloatingButton(TXT('进入音乐库  ↗', 'Enter Library  ↗'))
+        self.home_msr_button.clicked.connect(lambda: self.main_stack.setCurrentIndex(0))
+        banner_text.addWidget(self.home_msr_button, 0, Qt.AlignLeft)
+        banner_layout.addLayout(banner_text, 1)
+        thumbnail = QLabel(TXT('音乐库缩略图 · 待添加', 'Library thumbnail · placeholder'))
+        thumbnail.setObjectName('homeThumbnail')
+        thumbnail.setFixedSize(238, 132)
+        thumbnail.setAlignment(Qt.AlignCenter)
+        thumbnail.setStyleSheet(
+            'QLabel#homeThumbnail { background:#303a4d; border:1px dashed #69758a; '
+            'border-radius:17px; color:#c6cfdb; }')
+        banner_layout.addWidget(thumbnail)
+        layout.addWidget(banner)
+
+        daily, daily_layout, self.home_daily_heading = self._home_panel(
+            TXT('今日舟乐推荐', 'Today’s Arknights Track'), artwork=True)
+        daily.setMinimumHeight(225)
+        daily_row = QHBoxLayout()
+        self.home_daily_cover = QLabel()
+        self.home_daily_cover.setFixedSize(144, 144)
+        self.home_daily_cover.setAlignment(Qt.AlignCenter)
+        self.home_daily_cover.setStyleSheet(
+            'background:#303a4d; border:1px dashed #69758a; border-radius:17px;')
+        self.home_daily_cover.setText(TXT('封面', 'Cover'))
+        daily_row.addWidget(self.home_daily_cover)
+        daily_text = QVBoxLayout()
+        self.home_daily_title = QLabel(TXT('正在准备今日推荐…', 'Preparing today’s track…'))
+        self.home_daily_title.setStyleSheet('font-size:23px; font-weight:700; background:transparent;')
+        self.home_daily_title.setWordWrap(True)
+        daily_text.addWidget(self.home_daily_title)
+        self.home_daily_meta = QLabel('')
+        self.home_daily_meta.setWordWrap(True)
+        daily_text.addWidget(self.home_daily_meta)
+        self.home_daily_intro = QLabel(TXT('从塞壬唱片音乐库中每日选出一首。',
+                                           'A daily pick from the Monster Siren catalogue.'))
+        self.home_daily_intro.setWordWrap(True)
+        self.home_daily_intro.setMaximumHeight(58)
+        daily_text.addWidget(self.home_daily_intro)
+        daily_text.addStretch()
+        self.home_daily_play = FloatingButton(TXT('播放今日推荐  ▶', 'Play Today’s Pick  ▶'))
+        self.home_daily_play.setEnabled(False)
+        self.home_daily_play.clicked.connect(self._play_daily_song)
+        daily_text.addWidget(self.home_daily_play, 0, Qt.AlignLeft)
+        daily_row.addLayout(daily_text, 1)
+        daily_layout.addLayout(daily_row)
+        layout.addWidget(daily)
+
+        bottom = QHBoxLayout()
+        news, news_layout, self.home_news_heading = self._home_panel(TXT('每日药闻', 'Daily Pharmaceutical News'))
+        news.setMinimumHeight(155)
+        news_text = self._localized_label('内容即将上线 · 此处暂为占位。',
+                                          'Coming soon · this panel is a placeholder.')
+        news_text.setWordWrap(True)
+        news_layout.addWidget(news_text)
+        news_layout.addStretch()
+        bottom.addWidget(news, 1)
+        liked, liked_layout, self.home_liked_heading = self._home_panel(
+            TXT('22N7O 喜欢听的', '22N7O’s Favorites'), artwork=True)
+        liked.setMinimumHeight(155)
+        liked_cover = QLabel(TXT('封面 · 待添加', 'Cover · placeholder'))
+        liked_cover.setObjectName('homeLikedCover')
+        liked_cover.setFixedSize(80, 80)
+        liked_cover.setAlignment(Qt.AlignCenter)
+        liked_cover.setStyleSheet('background:#303a4d; border:1px dashed #69758a; border-radius:12px;')
+        liked_row = QHBoxLayout()
+        liked_row.addWidget(liked_cover)
+        liked_placeholder = self._localized_label('歌曲、信息与简介 · 待添加',
+                                                  'Track, details and description · coming soon')
+        liked_placeholder.setWordWrap(True)
+        liked_row.addWidget(liked_placeholder, 1)
+        liked_layout.addLayout(liked_row)
+        liked_layout.addStretch()
+        bottom.addWidget(liked, 1)
+        layout.addLayout(bottom)
+        self.home_guide = FloatingButton(TXT('打开使用指南', 'Open User Guide'))
+        self.home_guide.clicked.connect(self._show_guide)
+        layout.addWidget(self.home_guide, 0, Qt.AlignRight)
+        layout.addStretch()
+        page.setWidget(host)
+        return page
+
+    def _show_guide(self):
+        QMessageBox.information(self, TXT('Velia 使用指南', 'Velia User Guide'), TXT(
+            '主页可进入明日方舟音乐库，并查看每日推荐。播放器左侧搜索曲目、收藏歌曲和管理分类；点击专辑可展开曲目。右侧控制播放及查看歌词。设置可切换主题、语言、音频压缩选项与桌面歌词位置。音乐保存在 local/music，个人偏好保存在 local/preferences。',
+            'Enter the Monster Siren library or see the daily recommendation on Home. Search, favorite and organize tracks on the left; click an album to expand it. The right side controls playback and lyrics. Settings include theme, language, audio compression and desktop lyric placement. Music lives in local/music and preferences in local/preferences.'))
+
+    def _refresh_daily_song(self):
+        if not hasattr(self, 'home_daily_title'):
+            return
+        if not self.online_tracks:
+            self.home_daily_title.setText(TXT('正在准备今日推荐…', 'Preparing today’s track…'))
+            return
+        today = date.today().isoformat()
+        eligible = [t for t in self.online_tracks if t.get('title') and t.get('cid')]
+        if not eligible:
+            return
+        saved = self.settings_store.value('daily_recommendation', {})
+        track = next((t for t in eligible if t['cid'] == saved.get('cid')), None) if (
+            isinstance(saved, dict) and saved.get('date') == today) else None
+        if track is None:
+            eligible.sort(key=lambda t: int(t['cid']))
+            index = int(hashlib.sha256(today.encode('ascii')).hexdigest(), 16) % len(eligible)
+            track = eligible[index]
+            self.settings_store.setValue('daily_recommendation', {'date': today, 'cid': track['cid']})
+        self.home_daily_cid = track['cid']
+        self.home_daily_title.setText(track['title'])
+        self.home_daily_meta.setText('  ·  '.join(filter(None, (
+            track.get('artist', ''), track.get('album', ''),
+            self.prts_cache.get(track['cid'], {}).get('year', '')))))
+        intro = re.sub(r'<[^>]+>', '', track.get('intro') or '').strip()
+        self.home_daily_intro.setText(intro[:240] if intro else TXT(
+            '该曲目暂无官方简介；点击播放可查看歌曲信息。',
+            'No description available yet. Play to explore the song.'))
+        self.home_daily_play.setEnabled(True)
+        cover_path = ARTWORK_DIR / (track['cid'] + '.img')
+        if cover_path.is_file():
+            try:
+                track['cover_bytes'] = cover_path.read_bytes()
+            except OSError:
+                pass
+        if track.get('cover_bytes'):
+            self.home_daily_cover.setText('')
+            self.home_daily_cover.setPixmap(_rounded_cover(
+                self._pixmap_for_track(track, 144), 144, 17))
+        else:
+            self.home_daily_cover.setText(TXT('封面载入中', 'Loading cover'))
+            self.home_daily_cover.clear()
+            self.home_daily_cover.setText(TXT('封面载入中', 'Loading cover'))
+            self._ensure_cover(track)
+        if track.get('album_cid') and getattr(self, '_daily_intro_cid', None) != track['cid']:
+            self._daily_intro_cid = track['cid']
+            self._submit('daily_intro:' + track['cid'], siren.album_detail, track['album_cid'])
+
+    def _play_daily_song(self):
+        cid = getattr(self, 'home_daily_cid', '')
+        index = next((i for i, t in enumerate(self.online_tracks) if t['cid'] == cid), -1)
+        if index < 0:
+            return
+        if self.source_kind != 'online':
+            self.source_combo.setCurrentIndex(0)
+        self.main_stack.setCurrentIndex(0)
+        self.select_track(index, autoplay=True)
+
+    def _daily_midnight_check(self):
+        current_day = date.today().isoformat()
+        if getattr(self, '_daily_date', None) != current_day:
+            self._daily_date = current_day
+            self._refresh_daily_song()
 
     def _build_player_view(self):
         page = QWidget()
@@ -2112,6 +2386,11 @@ class MusicPage(QWidget):
         self.playlist_scroll.setWidget(self.playlist_host)
         self.playlist_scroll.verticalScrollBar().valueChanged.connect(self._maybe_load_more)
         ll.addWidget(self.playlist_scroll, 1)
+        self.to_top_btn = FloatingButton(TXT("↑ 回到顶部", "↑ Back to Top"))
+        self.to_top_btn.setToolTip(TXT("立即回到歌曲列表顶部", "Jump to the top of the song list"))
+        self.to_top_btn.clicked.connect(lambda: self.playlist_scroll.verticalScrollBar().setValue(0))
+        self.to_top_btn.setVisible(False)
+        ll.addWidget(self.to_top_btn, 0, Qt.AlignRight)
         main.addWidget(left)
 
         # Right detail / lyrics / transport
@@ -2822,6 +3101,8 @@ class MusicPage(QWidget):
 
     def _rebuild_playlist(self):
         scroll_y = self.playlist_scroll.verticalScrollBar().value() if hasattr(self, "playlist_scroll") else 0
+        if hasattr(self, "playlist_scroll"):
+            self.playlist_scroll.verticalScrollBar().blockSignals(True)
         self._cover_widgets = {}
         while self.playlist_layout.count() > 1:
             item = self.playlist_layout.takeAt(0)
@@ -2991,8 +3272,13 @@ class MusicPage(QWidget):
         if ACTIVE_THEME == "day":
             for widget in self.playlist_host.findChildren(QWidget):
                 recolor_widget(widget)
-        if scroll_y:
-            QTimer.singleShot(0, lambda: self.playlist_scroll.verticalScrollBar().setValue(scroll_y))
+        # Preserve the viewport as rows are appended. Never queue a delayed
+        # scroll update: rapid wheel events could race with an older rebuild.
+        bar = self.playlist_scroll.verticalScrollBar()
+        self.playlist_host.layout().activate()
+        bar.setValue(min(scroll_y, bar.maximum()))
+        bar.blockSignals(False)
+        self.to_top_btn.setVisible(bar.value() > 250)
 
     def _show_more_online(self):
         self._more_scheduled = False
@@ -3011,6 +3297,7 @@ class MusicPage(QWidget):
             self._submit("cover:" + cid, siren.fetch_bytes, track["cover_url"], 5 * 1024 * 1024)
 
     def _maybe_load_more(self, value):
+        self.to_top_btn.setVisible(value > 250)
         if self.source_kind != "online" or self._more_scheduled:
             return
         scrollbar = self.playlist_scroll.verticalScrollBar()
