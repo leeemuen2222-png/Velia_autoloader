@@ -1,7 +1,7 @@
 {
-  "font_family": "Microsoft YaHei UI",
-  "font_size": 30,
-  "font_weight": 700,
+  "font_family": "Perpetua",
+  "font_size": 26,
+  "font_weight": 800,
   "text_color": "#ffffff",
   "rainbow": true,
   "background_enabled": false,
@@ -11,5 +11,9 @@
   "desktop_lyrics_position": {
     "x": 277,
     "y": 79
+  },
+  "daily_recommendation": {
+    "date": "2026-09-29",
+    "cid": "880365"
   }
 }

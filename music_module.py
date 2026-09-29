@@ -1157,27 +1157,90 @@ class DesktopLyricsWindow(QWidget):
         self.move(x, y)
 
 
-class HomeArtworkPanel(QFrame):
-    """Subtle placeholder thumbnail behind the editorial music cards."""
+class HoverHomePanel(QFrame):
+    """Animated edge highlight without repainting child controls."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAttribute(Qt.WA_Hover, True)
+        self._hover_level = 0.0
+        self._hover_animation = QPropertyAnimation(self, b'hoverLevel', self)
+        self._hover_animation.setDuration(190)
+        self._hover_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._background_thumbnail = None
+
+    def _get_hover_level(self):
+        return self._hover_level
+
+    def _set_hover_level(self, value):
+        self._hover_level = float(value)
+        self.update()
+
+    hoverLevel = Property(float, _get_hover_level, _set_hover_level)
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        if self._hover_level <= 0:
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setOpacity(0.25)
-        painter.setBrush(QColor('#b0c0d4' if ACTIVE_THEME == 'day' else '#63728d'))
-        painter.setPen(Qt.NoPen)
-        w, h = self.width(), self.height()
-        painter.drawRoundedRect(max(0, w - 260), 22, 224, max(20, h - 44), 16, 16)
-        painter.setOpacity(0.58)
-        painter.setPen(QColor('#435570' if ACTIVE_THEME == 'day' else '#cad1dd'))
-        painter.drawText(max(0, w - 248), 25, 198, max(20, h - 50),
-                         Qt.AlignCenter | Qt.TextWordWrap,
-                         TXT('背景缩略图\n待添加', 'Background thumbnail\nplaceholder'))
+        color = QColor('#5673a4' if ACTIVE_THEME == 'day' else '#9ab5e7')
+        color.setAlpha(int(205 * self._hover_level))
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(color, 2))
+        radius = 27 if self.objectName() == 'homeBanner' else 24
+        painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), radius, radius)
+
+    def enable_thumbnail(self):
+        label = QLabel(TXT('背景缩略图 · 待添加', 'Background thumbnail · placeholder'), self)
+        label.setAlignment(Qt.AlignCenter)
+        label.setObjectName('homeBackground')
+        label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        label.setStyleSheet('QLabel#homeBackground { background:#273244; color:#a2b1cb; border:0; border-radius:19px; }')
+        self._background_thumbnail = label
+        label.lower()
+        self._layout_thumbnail()
+
+    def _layout_thumbnail(self):
+        if self._background_thumbnail is not None:
+            x = int(self.width() * float(self.property('thumbnailStart') or 0.39))
+            self._background_thumbnail.setGeometry(x, 18, max(20, self.width() - x - 18),
+                                                   max(20, self.height() - 36))
+            self._background_thumbnail.lower()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_thumbnail()
+
+    def _animate_shadow(self, hovered):
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover_level)
+        self._hover_animation.setEndValue(1.0 if hovered else 0.0)
+        self._hover_animation.start()
+
+    def enterEvent(self, event):
+        self._animate_shadow(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_shadow(False)
+        super().leaveEvent(event)
 
 
-class HomeLibraryBanner(QFrame):
+class HomeArtworkPanel(HoverHomePanel):
+    """Foreground content sits over a large background thumbnail."""
+
+    def __init__(self):
+        super().__init__()
+        self.enable_thumbnail()
+
+
+class HomeLibraryBanner(HoverHomePanel):
     clicked = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.enable_thumbnail()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
@@ -1305,17 +1368,29 @@ class MusicPage(QWidget):
         self._submit("catalogue", siren.catalogue)
 
     def _install_online_catalogue(self, songs):
-        previously = (self.tracks[self.current_index].get("cid")
-                      if self.source_kind == "online" and 0 <= self.current_index < len(self.tracks) else None)
-        self.online_tracks = []
+        if not isinstance(songs, list) or not songs:
+            return False
+        previous = {track['cid']: track for track in self.online_tracks}
+        current = (self.tracks[self.current_index]
+                   if self.source_kind == 'online' and 0 <= self.current_index < len(self.tracks) else None)
+        new_tracks = []
+        seen = set()
         for s in songs:
             cid = str(s.get("cid", ""))
-            if not cid.isdigit():
+            if not cid.isdigit() or cid in seen:
+                continue
+            seen.add(cid)
+            if cid in previous:
+                track = previous[cid]
+                for field in ('title', 'artist', 'album', 'album_cid', 'cover_url'):
+                    if s.get(field):
+                        track[field] = s[field]
+                new_tracks.append(track)
                 continue
             key = "siren/" + cid
-            self.online_tracks.append({
+            new_tracks.append({
                 "online": True, "cid": cid, "path": key,
-                "title": s.get("title", "—"), "artist": s.get("artist", "—"),
+                "title": s.get("title", "—"), "artist": s.get("artist", ""),
                 "album": s.get("album", ""), "album_cid": s.get("album_cid", ""),
                 "cover_url": s.get("cover_url", ""), "cover_bytes": None,
                 "cover_desc": TXT("塞壬唱片", "Monster Siren"), "track": "", "year": "",
@@ -1326,15 +1401,20 @@ class MusicPage(QWidget):
                 "favorite": bool(self.library_state.get("favorites", {}).get(key)),
                 "category": str(self.library_state.get("categories", {}).get(key, "")),
             })
+        if not new_tracks:
+            return False
+        # A partial catalogue response must never delete cached songs. Keep the
+        # existing order, append new IDs, and reuse track objects held by playback.
+        self.online_tracks = list(previous.values()) + [track for track in new_tracks if track['cid'] not in previous]
         if self.source_kind == "online":
             self.tracks = self.online_tracks
-            self.current_index = -1
+            self.current_index = (self.tracks.index(current) if current in self.tracks else -1)
             self._rebuild_playlist()
             self.scan_status.setText(TXT(f"塞壬唱片 · {len(self.tracks)} 首", f"Monster Siren · {len(self.tracks)} tracks"))
-            if self.tracks:
-                target = next((i for i, t in enumerate(self.tracks) if t["cid"] == previously), 0)
-                self.select_track(target, autoplay=False)
+            if self.current_index < 0 and self.tracks:
+                self.select_track(0, autoplay=False)
         self._refresh_daily_song()
+        return True
 
     def _network_done(self, kind, value, error):
         if kind.startswith('daily_intro:'):
@@ -1351,9 +1431,15 @@ class MusicPage(QWidget):
                 if not self.online_tracks:
                     self.scan_status.setText(TXT("在线曲库暂不可用 · 请检查网络", "Online catalogue unavailable · check connection"))
                 return
-            _write_json(PREFERENCE_DIR / "siren_catalogue.json", value)
-            if [t["cid"] for t in self.online_tracks] != [str(t.get("cid")) for t in value]:
-                self._install_online_catalogue(value)
+            if not isinstance(value, list) or not value:
+                return
+            if self._install_online_catalogue(value):
+                # Cache the union, so an incomplete response cannot replace a
+                # complete catalogue on the next startup.
+                catalogue = [{key: t.get(key, '') for key in
+                              ('cid', 'title', 'artist', 'album', 'album_cid', 'cover_url')}
+                             for t in self.online_tracks]
+                _write_json(PREFERENCE_DIR / 'siren_catalogue.json', catalogue)
         elif kind.startswith("cover:"):
             cid = kind.split(":", 1)[1]
             self._cover_pending.discard(cid)
@@ -1412,21 +1498,20 @@ class MusicPage(QWidget):
                     track["intro_source"] = value[0]["url"]
                     self._show_track_details(track)
         elif kind.startswith("credits:"):
-            cid = kind.split(":", 1)[1]
-            self._credits_pending.discard(cid)
-            if not error and isinstance(value, dict) and any(value.get(x) for x in ("year", "composer", "url")):
-                self.prts_cache[cid] = value
+            key = kind.split(":", 1)[1]
+            self._credits_pending.discard(key)
+            if not error and isinstance(value, dict):
+                self.prts_cache[key] = value
                 try:
                     _write_json(self.prts_cache_file, self.prts_cache)
                 except OSError:
                     pass
-            for track in self.online_tracks:
-                if track["cid"] == cid:
+            for track in (*self.online_tracks, *self.local_tracks):
+                if self._credits_key(track) == key:
                     self._apply_credits(track, value if isinstance(value, dict) else {})
-                    break
-            if self._pending_metadata_save == cid:
+            if self._pending_metadata_save == key:
                 self._pending_metadata_save = None
-                if 0 <= self.current_index < len(self.tracks) and self.tracks[self.current_index].get("cid") == cid:
+                if 0 <= self.current_index < len(self.tracks) and self._credits_key(self.tracks[self.current_index]) == key:
                     self._save_online_track()
         elif kind.startswith("save:"):
             self._saving_count = max(0, self._saving_count - 1)
@@ -1450,20 +1535,41 @@ class MusicPage(QWidget):
     def _apply_credits(self, track, credits):
         if credits:
             track["year"] = credits.get("year") or track.get("year", "")
-            track["composer"] = credits.get("composer", "")
+            prior_composer = track.get('composer', '')
+            if prior_composer.strip().casefold() in ('塞壬唱片-msr', '塞壬唱片', 'monster siren records'):
+                prior_composer = ''
+            track["composer"] = credits.get("composer") or prior_composer
+            for field in ('performer', 'lyricist', 'arranger', 'character', 'event', 'credited_artist'):
+                track[field] = credits.get(field, '')
             track["credits_url"] = credits.get("url", "")
             track["kind"] = credits.get("kind") or track.get("kind", "other")
+            artist_parts = [part.strip() for part in re.split(r'[,，、]', track.get('artist') or '')
+                            if part.strip() and part.strip().casefold() not in
+                            ('塞壬唱片-msr', '塞壬唱片', 'monster siren records')]
+            track['artist'] = ', '.join(artist_parts)
+            if not track.get('artist') or track['artist'].strip().casefold() in (
+                    '塞壬唱片-msr', '塞壬唱片', 'monster siren records'):
+                track['artist'] = (credits.get('credited_artist') or credits.get('performer')
+                                   or credits.get('composer') or '')
             if self.current_index >= 0 and self.tracks[self.current_index] is track:
+                self.detail_values['Artist'].setText(track.get('artist') or '—')
+                self.detail_values['Year'].setText(track.get('year') or '—')
+                self.hero_artist.setText(track.get('artist') or '')
                 self._show_track_details(track)
 
+    def _credits_key(self, track):
+        if track.get('online'):
+            return track['cid']
+        return 'local_' + hashlib.sha1(self._track_key(track['path']).encode('utf-8')).hexdigest()[:16]
+
     def _request_credits(self, track):
-        cid = track["cid"]
-        cached = self.prts_cache.get(cid, {})
-        if any(cached.get(x) for x in ("year", "composer", "url")):
-            self._apply_credits(track, self.prts_cache[cid])
-        if (not cached.get("year") or not cached.get("kind")) and cid not in self._credits_pending:
-            self._credits_pending.add(cid)
-            self._submit("credits:" + cid, siren.prts_credits, track["title"], track["album"])
+        key = self._credits_key(track)
+        cached = self.prts_cache.get(key, {})
+        if cached:
+            self._apply_credits(track, cached)
+        if cached.get('metadata_version', 0) < 3 and key not in self._credits_pending:
+            self._credits_pending.add(key)
+            self._submit('credits:' + key, siren.prts_credits, track['title'], track['album'])
 
     def _online_job(self, track):
         cid = track["cid"]
@@ -1543,10 +1649,33 @@ class MusicPage(QWidget):
         self.album_intro.setToolTip(track.get("intro_source") or
                                     (siren.ROOT + "/" if track.get("online") else ""))
         self.album_intro.setVisible(bool(intro))
-        composer = track.get("composer", "")
-        self.credits_label.setText(TXT("作曲：", "Composer: ") + composer if composer else "")
+        kind = track.get('kind', 'other')
+        character = track.get('character', '').strip(' 〖〗')
+        event = track.get('event', '').strip(' 〖〗')
+        album = track.get('album', '').strip()
+        if kind == 'ep' and character:
+            context = TXT(f'{character} 的 EP', f'{character} · Operator EP')
+        elif kind == 'ost' and event:
+            context = TXT(f'{event} 活动 OST', f'{event} · Event OST')
+        elif event:
+            context = TXT(f'相关活动：{event}', f'Related event: {event}')
+        elif kind in ('ep', 'ost', 'op', 'ed') and album:
+            context = f'{kind.upper()} · {album}'
+        else:
+            context = ''
+        self.context_label.setText(context)
+        self.context_label.setToolTip(track.get('credits_url', ''))
+        self.context_label.setVisible(bool(context))
+        parts = []
+        for field, zh, en in (('composer', '作曲', 'Composer'),
+                              ('lyricist', '作词', 'Lyrics'),
+                              ('arranger', '编曲', 'Arrangement'),
+                              ('performer', '演唱／演奏', 'Performed by')):
+            if track.get(field):
+                parts.append(TXT(zh, en) + '：' + track[field])
+        self.credits_label.setText('    ·    '.join(parts))
         self.credits_label.setToolTip(track.get("credits_url", ""))
-        self.credits_label.setVisible(bool(composer))
+        self.credits_label.setVisible(bool(parts))
 
     def _localized_label(self, zh, en):
         label = QLabel(TXT(zh, en))
@@ -1659,17 +1788,24 @@ class MusicPage(QWidget):
                 widget.update()
         day = ACTIVE_THEME == 'day'
         for card in self.findChildren(QFrame, 'homePanel'):
-            card.setStyleSheet('QFrame#homePanel { background:%s; border:1px solid %s; border-radius:24px; }' %
-                               (('#ffffff', '#c7d2df') if day else ('#15181f', '#303742')))
+            card.setStyleSheet('QFrame#homePanel { background:%s; border:1px solid %s; border-radius:24px; } '
+                               'QFrame#homePanel:hover { border-color:%s; }' %
+                               (('#ffffff', '#c7d2df', '#7890b3') if day else
+                                ('#15181f', '#303742', '#7790b9')))
         for banner in self.findChildren(QFrame, 'homeBanner'):
-            banner.setStyleSheet('QFrame#homeBanner { background:%s; border:1px solid %s; border-radius:27px; }' %
-                                 (('#e6edf6', '#bac8d9') if day else ('#202836', '#475369')))
+            banner.setStyleSheet('QFrame#homeBanner { background:%s; border:1px solid %s; border-radius:27px; } '
+                                 'QFrame#homeBanner:hover { border-color:%s; }' %
+                                 (('#e6edf6', '#bac8d9', '#7890b3') if day else
+                                  ('#202836', '#475369', '#92a8ce')))
         self.home_msr_note.setStyleSheet('color:%s; background:transparent; border:0;' %
                                          ('#455a74' if day else '#afb9cc'))
         for holder in self.findChildren(QLabel, 'homeThumbnail'):
             holder.setStyleSheet('QLabel#homeThumbnail { background:%s; border:1px dashed %s; border-radius:17px; color:%s; }' %
                                  (('#d8e2ef', '#8699af', '#455a74') if day else
                                   ('#303a4d', '#69758a', '#c6cfdb')))
+        for holder in self.findChildren(QLabel, 'homeBackground'):
+            holder.setStyleSheet('QLabel#homeBackground { background:%s; color:%s; border:0; border-radius:19px; }' %
+                                 (('#d7e1ee', '#657994') if day else ('#273244', '#a2b1cb')))
         for holder in self.findChildren(QLabel, 'homeLikedCover'):
             holder.setStyleSheet('QLabel#homeLikedCover { background:%s; border:1px dashed %s; border-radius:12px; }' %
                                  (('#d8e2ef', '#8699af') if day else ('#303a4d', '#69758a')))
@@ -2087,7 +2223,7 @@ class MusicPage(QWidget):
         self.main_stack.setCurrentIndex(2)
 
     def _home_panel(self, title, artwork=False):
-        panel = HomeArtworkPanel() if artwork else QFrame()
+        panel = HomeArtworkPanel() if artwork else HoverHomePanel()
         panel.setObjectName('homePanel')
         panel.setStyleSheet(
             'QFrame#homePanel { background:#15181f; border:1px solid #303742; border-radius:24px; }')
@@ -2113,6 +2249,7 @@ class MusicPage(QWidget):
 
         banner = HomeLibraryBanner()
         banner.setObjectName('homeBanner')
+        banner.setProperty('thumbnailStart', 0.24)
         banner.setCursor(Qt.PointingHandCursor)
         banner.clicked.connect(lambda: self.main_stack.setCurrentIndex(0))
         banner.setMinimumHeight(195)
@@ -2133,18 +2270,11 @@ class MusicPage(QWidget):
         self.home_msr_button.clicked.connect(lambda: self.main_stack.setCurrentIndex(0))
         banner_text.addWidget(self.home_msr_button, 0, Qt.AlignLeft)
         banner_layout.addLayout(banner_text, 1)
-        thumbnail = QLabel(TXT('音乐库缩略图 · 待添加', 'Library thumbnail · placeholder'))
-        thumbnail.setObjectName('homeThumbnail')
-        thumbnail.setFixedSize(238, 132)
-        thumbnail.setAlignment(Qt.AlignCenter)
-        thumbnail.setStyleSheet(
-            'QLabel#homeThumbnail { background:#303a4d; border:1px dashed #69758a; '
-            'border-radius:17px; color:#c6cfdb; }')
-        banner_layout.addWidget(thumbnail)
         layout.addWidget(banner)
 
         daily, daily_layout, self.home_daily_heading = self._home_panel(
             TXT('今日舟乐推荐', 'Today’s Arknights Track'), artwork=True)
+        daily.setProperty('thumbnailStart', 0.52)
         daily.setMinimumHeight(225)
         daily_row = QHBoxLayout()
         self.home_daily_cover = QLabel()
@@ -2178,7 +2308,7 @@ class MusicPage(QWidget):
 
         bottom = QHBoxLayout()
         news, news_layout, self.home_news_heading = self._home_panel(TXT('每日药闻', 'Daily Pharmaceutical News'))
-        news.setMinimumHeight(155)
+        news.setMinimumHeight(225)
         news_text = self._localized_label('内容即将上线 · 此处暂为占位。',
                                           'Coming soon · this panel is a placeholder.')
         news_text.setWordWrap(True)
@@ -2187,7 +2317,8 @@ class MusicPage(QWidget):
         bottom.addWidget(news, 1)
         liked, liked_layout, self.home_liked_heading = self._home_panel(
             TXT('22N7O 喜欢听的', '22N7O’s Favorites'), artwork=True)
-        liked.setMinimumHeight(155)
+        liked.setProperty('thumbnailStart', 0.28)
+        liked.setMinimumHeight(225)
         liked_cover = QLabel(TXT('封面 · 待添加', 'Cover · placeholder'))
         liked_cover.setObjectName('homeLikedCover')
         liked_cover.setFixedSize(80, 80)
@@ -2490,8 +2621,15 @@ class MusicPage(QWidget):
         self.album_intro.hide()
         rl.addWidget(self.album_intro)
 
+        self.context_label = QLabel('')
+        self.context_label.setStyleSheet('color:#8a9ab9; font-size:12px; padding:1px 5px;')
+        self.context_label.setWordWrap(True)
+        self.context_label.hide()
+        rl.addWidget(self.context_label)
+
         self.credits_label = QLabel("")
         self.credits_label.setStyleSheet("color:#858585; font-size:11px; padding:2px 5px;")
+        self.credits_label.setWordWrap(True)
         self.credits_label.hide()
         rl.addWidget(self.credits_label)
 
@@ -3330,7 +3468,14 @@ class MusicPage(QWidget):
         self._pending_metadata_save = None
         self.current_index = index
         track = self.tracks[index]
-        if track.get("online"):
+        msr_local = ('Monster Siren' in str(track.get('path', '')) or
+                     'Monster Siren' in self._track_key(track.get('path', '')) or
+                     '塞壬唱片' in str(track.get('artist', '')))
+        artist_parts = [part.strip() for part in re.split(r'[,，、]', track.get('artist') or '')
+                        if part.strip() and part.strip().casefold() not in
+                        ('塞壬唱片-msr', '塞壬唱片', 'monster siren records')]
+        track['artist'] = ', '.join(artist_parts)
+        if track.get('online') or msr_local:
             self._request_credits(track)
         self.current_lyrics = track.get("lyrics", [])
         self.current_lyric_index = -1

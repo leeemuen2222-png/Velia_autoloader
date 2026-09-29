@@ -7,6 +7,7 @@ No media is downloaded until a song is selected or explicitly saved.
 import argparse
 import html
 from html.parser import HTMLParser
+from functools import lru_cache
 import json
 import io
 import re
@@ -53,7 +54,8 @@ def catalogue():
     albums = {str(a["cid"]): a for a in api("/api/albums")}
     songs = api("/api/songs")["list"]
     return [dict(cid=str(s["cid"]), title=s.get("name") or "—",
-                 artist=", ".join(s.get("artists") or s.get("artistes") or []) or "塞壬唱片-MSR",
+                 artist=", ".join(a for a in (s.get("artists") or s.get("artistes") or [])
+                                   if a not in ("塞壬唱片-MSR", "Monster Siren Records")) or "",
                  album=albums.get(str(s.get("albumCid")), {}).get("name", ""),
                  album_cid=str(s.get("albumCid") or ""),
                  cover_url=albums.get(str(s.get("albumCid")), {}).get("coverUrl", ""))
@@ -152,6 +154,72 @@ class _ArticleText(HTMLParser):
             self.parts.append(data)
 
 
+class _MusicRows(HTMLParser):
+    """Keep cells separate so a related event cannot be mistaken for an artist."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+        self.row = None
+        self.cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'tr':
+            self.row = []
+        elif tag in ('td', 'th') and self.row is not None:
+            self.cell = []
+
+    def handle_data(self, data):
+        if self.cell is not None:
+            self.cell.append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ('td', 'th') and self.cell is not None:
+            self.row.append(' '.join(''.join(self.cell).split()))
+            self.cell = None
+        elif tag == 'tr' and self.row is not None:
+            if self.row:
+                self.rows.append(self.row)
+            self.row = None
+
+
+@lru_cache(maxsize=1)
+def _related_music_rows():
+    query = urllib.parse.urlencode({'action': 'parse', 'page': '衍生作品/音乐',
+                                    'prop': 'text', 'format': 'json'})
+    parsed = json.loads(fetch_bytes('https://prts.wiki/api.php?' + query, 18 * 1024 * 1024))
+    parser = _MusicRows()
+    parser.feed(parsed.get('parse', {}).get('text', {}).get('*', ''))
+    return parser.rows
+
+
+def _related_music(title):
+    normalize = lambda text: re.sub(r'[^\w]+', '', text, flags=re.UNICODE).casefold()
+    wanted = normalize(title)
+    for row in _related_music_rows():
+        if len(row) < 4 or normalize(row[0]) != wanted:
+            continue
+        # Title | credited artist | MV character | related event | date | album.
+        return {'performer': row[1] if row[1] != '-' else '',
+                'character': row[2] if row[2] != '-' else '',
+                'event': row[3] if row[3] != '-' else ''}
+    return {}
+
+
+def _wiki_gg_article(title):
+    """Exact wiki.gg title only; do not attach a similar track's credits."""
+    query = urllib.parse.urlencode({'action': 'query', 'titles': title,
+                                    'prop': 'extracts|info', 'explaintext': 1,
+                                    'inprop': 'url', 'format': 'json', 'redirects': 1})
+    data = json.loads(fetch_bytes('https://arknights.wiki.gg/api.php?' + query))
+    normalize = lambda text: re.sub(r'[^\w]+', '', text, flags=re.UNICODE).casefold()
+    for page in (data.get('query') or {}).get('pages', {}).values():
+        page_title = re.sub(r'\s*\((?:song|music)\)$', '', page.get('title', ''), flags=re.I)
+        if 'missing' not in page and normalize(page_title) == normalize(title):
+            return html.unescape(page.get('extract', '')), page.get('fullurl', '')
+    return None
+
+
 def _prts_article(title):
     """Fetch one exact PRTS article; use parse HTML when TextExtracts is absent."""
     base = "https://prts.wiki/api.php?"
@@ -192,14 +260,32 @@ def _prts_article(title):
     return body, fallback_url
 
 
-def prts_credits(title, album=""):
-    """Classify from exact PRTS song/album articles; keep unknown as other."""
-    kind = "ost" if re.search(r"(?:OST|原声带|Original Soundtrack)\s*$", album, re.I) else "other"
-    if re.search(r"(?:\bOP\b|片头曲)\s*$", title, re.I):
-        kind = "op"
-    if re.search(r"(?:\bED\b|片尾曲)\s*$", title, re.I):
-        kind = "ed"
-    result = {"year": "", "composer": "", "kind": kind, "url": ""}
+def _credit_value(text, names):
+    """One line from a credits section, keeping roles separate."""
+    pattern = r"(?:^|\n)\s*(?:" + '|'.join(names) + r")\s*[:：]\s*([^\n]{2,100})"
+    match = re.search(pattern, text, re.I)
+    return match.group(1).strip() if match else ''
+
+
+def _real_person(value):
+    """A record label/publisher is not automatically an individual creator."""
+    value = re.sub(r'\s+', ' ', value).strip(' :-')
+    return '' if value.casefold() in {
+        '塞壬唱片', '塞壬唱片-msr', 'monster siren records', 'hypergryph',
+        '鹰角网络', 'msr', 'unknown', '未知',
+    } else value
+
+
+def prts_credits(title, album=''):
+    """Exact song/album PRTS credits, then wiki.gg and PRTS event index."""
+    kind = 'ost' if re.search(r'(?:OST|原声带|Original Soundtrack)\s*$', album, re.I) else 'other'
+    if re.search(r'(?:\bOP\b|片头曲)\s*$', title, re.I):
+        kind = 'op'
+    if re.search(r'(?:\bED\b|片尾曲)\s*$', title, re.I):
+        kind = 'ed'
+    result = {'year': '', 'composer': '', 'lyricist': '', 'arranger': '',
+              'performer': '', 'credited_artist': '', 'character': '', 'event': '',
+              'kind': kind, 'url': '', 'metadata_version': 3}
     for name in dict.fromkeys((title, album)):
         if not name:
             continue
@@ -210,36 +296,71 @@ def prts_credits(title, album=""):
         if not article:
             continue
         body, url = article
-        lead = body.find("《" + name + "》")
-        if lead >= 0:
-            body = body[lead:]
-        head = re.split(r"\n\s*(?:歌词|曲目|导航菜单)\s*\n", body, maxsplit=1)[0][:6000]
-        result["url"] = result["url"] or url
-        year = re.search(r"(?:于|发行日期|发布时间|发售日期)[^\n]{0,45}?(20\d{2})年\s*\d{1,2}月", head)
+        head = re.split(r'\n\s*(?:歌词|曲目|导航菜单)\s*\n', body, maxsplit=1)[0][:6500]
+        result['url'] = result['url'] or url
+        year = re.search(r'(?:于|发行日期|发布时间|发售日期)[^\n]{0,45}?(20\d{2})\s*年\s*\d{1,2}\s*月', head)
         if not year:
-            year = re.search(r"(20\d{2})年\s*\d{1,2}月\s*\d{1,2}日[^\n]{0,18}(?:发行|发布)", head)
+            year = re.search(r'(20\d{2})\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日[^\n]{0,18}(?:发行|发布)', head)
         if not year:
-            year = re.search(r"(?:发布时间|发行日期)\s*[:：\s]*(20\d{2})[-年/]", head)
-        if year and not result["year"]:
-            result["year"] = year.group(1)
+            year = re.search(r'(?:发布时间|发行日期)\s*[:：\s]*(20\d{2})[-年/]', head)
+        if year and not result['year']:
+            result['year'] = year.group(1)
         if name == title:
-            composer = re.search(r"(?:作曲|音乐制作|编曲)\s*[:：]\s*([^\n]{2,95})", head)
-            if composer:
-                result["composer"] = composer.group(1).strip().split("  ")[0].strip()
-            if re.search(r"(?:同名|单曲)\s*EP|\bEP\s*专辑", head, re.I) and kind == "other":
-                kind = "ep"
-            if re.search(r"(?:作为|是|用作)[^\n]{0,40}(?:片头曲|主题歌\s*\[?OP\]?)", head):
-                kind = "op"
-            if re.search(r"(?:作为|是|用作)[^\n]{0,40}(?:片尾曲|主题歌\s*\[?ED\]?)", head):
-                kind = "ed"
-        elif kind == "other":
-            if re.search(r"(?:OST|原声带|Original Soundtrack)\s*$", name, re.I):
-                kind = "ost"
-            elif re.search(r"(?:同名|单曲)\s*EP|\bEP\s*专辑", head, re.I):
-                kind = "ep"
-        if result["year"] and result["composer"] and kind != "other":
-            break
-    result["kind"] = kind
+            roles = {'composer': ('作曲', 'Composer'), 'lyricist': ('作词', 'Lyricist'),
+                     'arranger': ('编曲', 'Arrangement', 'Arranger'),
+                     'performer': ('演唱', '歌唱', '主唱', '演奏', 'Vocal', 'Vocals', 'Performer')}
+            for key, labels in roles.items():
+                result[key] = _real_person(_credit_value(head, labels))
+            if re.search(r'(?:同名|单曲)\s*EP|\bEP\s*专辑', head, re.I) and kind == 'other':
+                kind = 'ep'
+            if re.search(r'(?:作为|是|用作)[^\n]{0,40}(?:片头曲|主题歌\s*\[?OP\]?)', head):
+                kind = 'op'
+            if re.search(r'(?:作为|是|用作)[^\n]{0,40}(?:片尾曲|主题歌\s*\[?ED\]?)', head):
+                kind = 'ed'
+        elif kind == 'other':
+            if re.search(r'(?:OST|原声带|Original Soundtrack)\s*$', name, re.I):
+                kind = 'ost'
+            elif re.search(r'(?:同名|单曲)\s*EP|\bEP\s*专辑', head, re.I):
+                kind = 'ep'
+
+    # English wiki descriptions can identify an operator EP missed by the
+    # Chinese article; retain PRTS as the primary source when it has credits.
+    try:
+        wiki = _wiki_gg_article(title)
+    except Exception:
+        wiki = None
+    if wiki:
+        body, wiki_url = wiki
+        lead = body[:2200]
+        if not result['composer']:
+            match = re.search(r'compos(?:ed|er)\s+by\s+([^.,;\n]{2,65})', lead, re.I)
+            if not match:
+                match = re.search(r'\bComposer\s*:\s*([^\n]{2,65})', lead, re.I)
+            if match:
+                result['composer'] = _real_person(match.group(1))
+        if not result['performer']:
+            match = re.search(r'perform(?:ed)?\s+by\s+(?:the\s+)?([^.,;\n]{2,75})', lead, re.I)
+            if not match:
+                match = re.search(r'\b(?:Vocals|Singer|Performer)\s*:\s*([^\n]{2,75})', lead, re.I)
+            if match:
+                result['performer'] = _real_person(match.group(1))
+        if kind == 'other' and re.search(r'(?:Operator|character)\s+EP', lead, re.I):
+            kind = 'ep'
+        if not result['character']:
+            match = re.search(r'(?:Operator|character)\s+EP\s+of\s+([\w \-’]+)', lead, re.I)
+            if match:
+                result['character'] = match.group(1).strip()
+        result['url'] = result['url'] or wiki_url
+
+    try:
+        related = _related_music(title)
+    except Exception:
+        related = {}
+    if related:
+        result['credited_artist'] = _real_person(related.get('performer', ''))
+        result['character'] = result['character'] or related.get('character', '')
+        result['event'] = related.get('event', '')
+    result['kind'] = kind
     return result
 
 
@@ -304,6 +425,10 @@ def save_ep_zip(track, audio_path, lyric_path, output_dir, compress=True,
             tags.add(TCON(encoding=3, text=kind.upper()))
             if track.get("composer"):
                 tags.add(TCOM(encoding=3, text=track["composer"]))
+            for field, desc in (('performer', 'PERFORMER'), ('lyricist', 'LYRICIST'),
+                                ('character', 'OPERATOR'), ('event', 'RELATED_EVENT')):
+                if track.get(field):
+                    tags.add(TXXX(encoding=3, desc=desc, text=track[field]))
             tags.add(TXXX(encoding=3, desc="SOURCE", text=track.get("credits_url") or ROOT))
         if lyric_path and Path(lyric_path).is_file():
             shutil.copy2(lyric_path, stage / (stem + ".lrc"))
