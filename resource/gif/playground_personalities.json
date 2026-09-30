@@ -1,5 +1,5 @@
 {
-  "version": 8,
+  "version": 9,
   "defaults": {
     "relationship_weight": 1.0,
     "relationship_label": "友好同事/外人"
@@ -518,6 +518,86 @@
         4,
         8
       ]
+    },
+    "ulpianus_stern_guardian": {
+      "behavior": "drifter",
+      "behavior_mix": {
+        "drifter": 0.56,
+        "patrol": 0.24,
+        "perimeter": 0.1,
+        "local_wander": 0.06,
+        "wander": 0.04
+      },
+      "speed": [
+        0.034,
+        0.052
+      ],
+      "turn_interval": [
+        10.0,
+        16.0
+      ],
+      "rest_chance": 0.18,
+      "rest_duration": [
+        2.0,
+        4.0
+      ],
+      "observe_chance": 0.28,
+      "observe_duration": [
+        3.0,
+        6.0
+      ],
+      "observe_radius": 0.36,
+      "social_goal_chance": 0.035,
+      "relationship_goal_gain": 0.82,
+      "max_social_goal_chance": 0.34,
+      "preferred_social_distance": 0.22,
+      "social_jitter": 0.03,
+      "interaction_chance": 0.34,
+      "interaction_distance": 0.09,
+      "social_duration": [
+        1.2,
+        2.2
+      ],
+      "social_cooldown": [
+        9.0,
+        15.0
+      ],
+      "repeat_partner_cooldown": [
+        22.0,
+        36.0
+      ],
+      "post_social_roam": [
+        9.0,
+        15.0
+      ],
+      "crowd_avoidance": 0.36,
+      "crowd_radius": 0.3,
+      "avoidance_distance": 0.28,
+      "depth_bias": 0.6,
+      "depth_variance": 0.18,
+      "burst_after_pause_chance": 0.015,
+      "burst_after_social_chance": 0.01,
+      "burst_multiplier": 1.1,
+      "burst_duration": [
+        0.6,
+        1.0
+      ],
+      "speech_style": "stern",
+      "conversation_join_chance": 0.035,
+      "conversation_join_radius": 0.23,
+      "conversation_speakiness": 0.72,
+      "typing_speed": [
+        10,
+        14
+      ],
+      "conversation_turn_pause": [
+        0.62,
+        0.95
+      ],
+      "conversation_turns": [
+        3,
+        5
+      ]
     }
   },
   "characters": {
@@ -565,6 +645,15 @@
       ],
       "profile": "specter_fervent_chaotic_hunter",
       "speed_multiplier": 1.0
+    },
+    "ulpianus": {
+      "display_name": "乌尔比安",
+      "aliases": [
+        "ulpianus",
+        "乌尔比安"
+      ],
+      "profile": "ulpianus_stern_guardian",
+      "speed_multiplier": 1.0
     }
   },
   "relationships": {
@@ -582,6 +671,10 @@
         "weight": 1.0
       },
       "specter": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "ulpianus": {
         "label": "友好同事",
         "weight": 1.0
       }
@@ -602,6 +695,10 @@
       "specter": {
         "label": "友好同事",
         "weight": 1.0
+      },
+      "ulpianus": {
+        "label": "友好同事",
+        "weight": 1.0
       }
     },
     "ishar-mla": {
@@ -620,6 +717,10 @@
       "specter": {
         "label": "高亲密度/深海猎人同伴",
         "weight": 1.9
+      },
+      "ulpianus": {
+        "label": "高亲密度/原直属上级",
+        "weight": 2.05
       }
     },
     "gla-dia": {
@@ -638,6 +739,10 @@
       "specter": {
         "label": "高亲密度/同伴与重要成员",
         "weight": 1.95
+      },
+      "ulpianus": {
+        "label": "高亲密度/同级队长、理念有分歧",
+        "weight": 1.85
       }
     },
     "specter": {
@@ -646,6 +751,32 @@
         "weight": 1.95
       },
       "ishar-mla": {
+        "label": "高亲密度/深海猎人同伴",
+        "weight": 1.9
+      },
+      "lmun": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "spuria": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "ulpianus": {
+        "label": "高亲密度/深海猎人同伴",
+        "weight": 1.9
+      }
+    },
+    "ulpianus": {
+      "ishar-mla": {
+        "label": "高亲密度/原直属队员",
+        "weight": 2.05
+      },
+      "gla-dia": {
+        "label": "高亲密度/同级队长、理念有分歧",
+        "weight": 1.85
+      },
+      "specter": {
         "label": "高亲密度/深海猎人同伴",
         "weight": 1.9
       },
