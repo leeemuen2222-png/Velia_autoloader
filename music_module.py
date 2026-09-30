@@ -6,24 +6,29 @@ The local directory holds music, preferences and the disposable ZIP cache.
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import threading
+import time
+import unicodedata
 import wave
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 import monster_siren_client as siren
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Property, QPropertyAnimation, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPainterPath, QPalette, QPen, QPixmap
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Property, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QImage, QImageReader, QMovie, QPainter, QPainterPath, QPalette, QPen, QPixmap, QRegion
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QColorDialog, QComboBox,
-    QDialog, QDialogButtonBox, QFontComboBox, QFrame, QGraphicsDropShadowEffect,
+    QDialog, QDialogButtonBox, QFileDialog, QFontComboBox, QFrame, QGraphicsDropShadowEffect,
     QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
     QSizePolicy, QSlider, QSpinBox, QStackedWidget, QStyle, QStyleOptionButton,
@@ -44,6 +49,9 @@ MUSIC_LIBRARY_DIR = LOCAL_DIR / "music"
 PREFERENCE_DIR = LOCAL_DIR / "preferences"
 CACHE_DIR = LOCAL_DIR / "cache"
 ARTWORK_DIR = LOCAL_DIR / "artwork_cache"
+RESOURCE_DIR = BASE_DIR / "resource"
+RESOURCE_PIC_DIR = RESOURCE_DIR / "pic"
+RESOURCE_GIF_DIR = RESOURCE_DIR / "gif"
 SETTINGS_FILE = PREFERENCE_DIR / "settings.json"
 LIBRARY_STATE_FILE = PREFERENCE_DIR / "library_state.json"
 APP_SETTINGS = {"language": "zh"}
@@ -1192,7 +1200,7 @@ class HoverHomePanel(QFrame):
         painter.drawRoundedRect(self.rect().adjusted(2, 2, -2, -2), radius, radius)
 
     def enable_thumbnail(self):
-        label = QLabel(TXT('背景缩略图 · 待添加', 'Background thumbnail · placeholder'), self)
+        label = QLabel(self)
         label.setAlignment(Qt.AlignCenter)
         label.setObjectName('homeBackground')
         label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -1227,12 +1235,63 @@ class HoverHomePanel(QFrame):
         super().leaveEvent(event)
 
 
+class CoverImageLabel(QLabel):
+    """Paint a pixmap edge-to-edge using cover cropping without distortion."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = QPixmap()
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def setSourcePixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap)
+        self.update()
+
+    def clearSourcePixmap(self):
+        self._source_pixmap = QPixmap()
+        self.update()
+
+    def paintEvent(self, event):
+        if self._source_pixmap.isNull():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        target = QRectF(self.rect())
+        source = QRectF(self._source_pixmap.rect())
+        if target.width() <= 0 or target.height() <= 0:
+            return
+
+        target_ratio = target.width() / target.height()
+        source_ratio = source.width() / source.height()
+        if source_ratio > target_ratio:
+            crop_w = source.height() * target_ratio
+            source.setX((self._source_pixmap.width() - crop_w) / 2.0)
+            source.setWidth(crop_w)
+        else:
+            crop_h = source.width() / target_ratio
+            source.setY((self._source_pixmap.height() - crop_h) / 2.0)
+            source.setHeight(crop_h)
+        painter.drawPixmap(target, self._source_pixmap, source)
+
+
 class HomeArtworkPanel(HoverHomePanel):
     """Foreground content sits over a large background thumbnail."""
 
     def __init__(self):
         super().__init__()
         self.enable_thumbnail()
+
+
+class ClickableHomePanel(HoverHomePanel):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class HomeLibraryBanner(HoverHomePanel):
@@ -1249,6 +1308,1046 @@ class HomeLibraryBanner(HoverHomePanel):
             return
         super().mouseReleaseEvent(event)
 
+
+
+class PlaygroundCanvas(QWidget):
+    """Multi-operator pseudo-3D playground.
+
+    Each complete r/m/s GIF set becomes one actor. The selected actor is driven
+    by WASD; every other awake actor uses personality-driven local pathfinding.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setMinimumHeight(560)
+        self._keys = set()
+        self._actors = []
+        self._selected = -1
+        self._asset_error = ''
+        self._personality_data = self._load_personalities()
+        self._discover_and_load_actors()
+
+        self._clock = QTimer(self)
+        self._clock.setInterval(16)
+        self._clock.timeout.connect(self._tick)
+        self._clock.start()
+
+    # ---------- asset discovery ----------
+
+    @staticmethod
+    def _animation_token(filename, fallback='actor'):
+        """Return (actor_id, mode) for foo_m/foo_r/foo_s/foo_in GIF names."""
+        stem = Path(filename).stem
+        stem = re.sub(r'\(\d+\)$', '', stem).strip()
+        match = re.match(r'^(.*?)[_-](in|[mrs])$', stem, re.I)
+        if match:
+            actor_id = match.group(1).strip(' _-') or fallback
+            token = match.group(2).lower()
+        elif stem.lower() in ('m', 'r', 's', 'in'):
+            actor_id, token = fallback, stem.lower()
+        else:
+            return None
+        mode = {'m': 'move', 'r': 'relax', 's': 'sleep', 'in': 'social'}[token]
+        return actor_id, mode
+
+    @staticmethod
+    def _safe_actor_id(value):
+        value = re.sub(r'\s+', '_', str(value).strip())
+        value = re.sub(r'[^\w.-]+', '_', value, flags=re.UNICODE).strip('._')
+        return value or 'actor'
+
+    def _discover_actor_sets(self):
+        """Discover complete r/m/s sets from loose GIFs and every ZIP under resource/gif."""
+        root = RESOURCE_GIF_DIR
+        cache = CACHE_DIR / 'playground_actors'
+        shutil.rmtree(cache, ignore_errors=True)
+        cache.mkdir(parents=True, exist_ok=True)
+
+        groups = {}
+        sources = {}
+
+        def add_file(actor_id, mode, path, source_name):
+            key = self._safe_actor_id(actor_id).casefold()
+            groups.setdefault(key, {})[mode] = Path(path)
+            sources.setdefault(key, source_name)
+
+        # Loose GIFs / folders are supported as well as ZIP packs.
+        if root.is_dir():
+            for path in root.rglob('*.gif'):
+                parsed = self._animation_token(path.name, path.parent.name)
+                if parsed:
+                    actor_id, mode = parsed
+                    add_file(actor_id, mode, path, str(path.parent))
+
+        archives = sorted(root.rglob('*.zip')) if root.is_dir() else []
+        errors = []
+        for archive in archives:
+            archive_groups = {}
+            try:
+                with zipfile.ZipFile(archive, 'r') as zf:
+                    for member in zf.infolist():
+                        if member.is_dir() or not member.filename.lower().endswith('.gif'):
+                            continue
+                        fallback = Path(archive.stem).name
+                        parsed = self._animation_token(Path(member.filename).name, fallback)
+                        if not parsed:
+                            continue
+                        actor_id, mode = parsed
+                        key = self._safe_actor_id(actor_id).casefold()
+                        archive_groups.setdefault(key, {})[mode] = member
+
+                    for key, modes in archive_groups.items():
+                        if not all(m in modes for m in ('move', 'relax', 'sleep')):
+                            continue
+                        # Avoid overriding a complete loose-file set.
+                        if key in groups and all(m in groups[key] for m in ('move', 'relax', 'sleep')):
+                            continue
+                        actor_cache = cache / self._safe_actor_id(f'{archive.stem}_{key}')
+                        actor_cache.mkdir(parents=True, exist_ok=True)
+                        extracted = {}
+                        for mode, suffix in (('move', 'm'), ('relax', 'r'), ('sleep', 's'), ('social', 'in')):
+                            if mode not in modes:
+                                continue
+                            target = actor_cache / f'{key}_{suffix}.gif'
+                            with zf.open(modes[mode], 'r') as source, target.open('wb') as dest:
+                                shutil.copyfileobj(source, dest)
+                            if target.stat().st_size > 128:
+                                extracted[mode] = target
+                        if all(m in extracted for m in ('move', 'relax', 'sleep')):
+                            groups[key] = extracted
+                            sources[key] = archive.name
+            except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+                errors.append(f'{archive.name}: {error}')
+
+        complete = []
+        for key, modes in sorted(groups.items()):
+            if all(m in modes for m in ('move', 'relax', 'sleep')):
+                complete.append({
+                    'id': key,
+                    'source': sources.get(key, ''),
+                    'paths': modes,
+                })
+
+        if not complete:
+            details = '; '.join(errors) if errors else TXT(
+                'resource/gif 中没有发现完整的 _m/_r/_s GIF 组合',
+                'No complete _m/_r/_s GIF set was found under resource/gif')
+            self._asset_error = details
+        return complete
+
+    # ---------- personality JSON ----------
+
+    def _load_personalities(self):
+        """Load AI profiles and the weighted relationship graph."""
+        built_in = {
+            'profiles': {},
+            'characters': {},
+            'relationships': {},
+            'relationship_tiers': {},
+            'defaults': {'relationship_weight': 1.0},
+        }
+        path = RESOURCE_GIF_DIR / 'playground_personalities.json'
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    for key in ('profiles', 'characters', 'relationships',
+                                'relationship_tiers', 'defaults'):
+                        value = loaded.get(key)
+                        if isinstance(value, dict):
+                            built_in[key].update(value)
+            except (OSError, ValueError, TypeError):
+                pass
+        return built_in
+
+    def _personality_for(self, actor_id):
+        profiles = self._personality_data.get('profiles') or {}
+        characters = self._personality_data.get('characters') or {}
+        char = characters.get(actor_id, characters.get(actor_id.casefold(), {})) or {}
+        if not char:
+            for _key, data in characters.items():
+                aliases = [str(a).casefold() for a in (data.get('aliases') or [])]
+                if actor_id.casefold() in aliases:
+                    char = data
+                    break
+
+        profile_name = char.get('profile')
+        if profile_name not in profiles:
+            names = sorted(profiles) or ['default']
+            digest = hashlib.sha1(actor_id.encode('utf-8', errors='ignore')).hexdigest()
+            profile_name = names[int(digest[:8], 16) % len(names)] if names else 'default'
+
+        profile = dict(profiles.get(profile_name) or {})
+        for key, value in char.items():
+            if key not in ('profile', 'aliases'):
+                profile[key] = value
+        profile['profile_name'] = profile_name
+        profile['display_name'] = profile.get('display_name') or actor_id
+        profile['speed_multiplier'] = float(profile.get('speed_multiplier', 1.0) or 1.0)
+        return profile
+
+    @staticmethod
+    def _visible_rect(pixmap):
+        if pixmap.isNull():
+            return QRect()
+        try:
+            mask = pixmap.mask()
+            if not mask.isNull():
+                rect = QRegion(mask).boundingRect()
+                if rect.isValid() and not rect.isNull():
+                    return rect
+        except Exception:
+            pass
+        return pixmap.rect()
+
+    def _make_movies(self, spec):
+        movies = {}
+        visible_union = QRect()
+        invalid = []
+        required = ('move', 'relax', 'sleep')
+        available = list(required)
+        if spec['paths'].get('social'):
+            available.append('social')
+
+        frame_rect = QRect()
+        for mode in available:
+            path = spec['paths'][mode]
+            movie = QMovie(str(path), parent=self)
+            movie.setCacheMode(QMovie.CacheAll)
+            movie.setSpeed(100)
+            if not movie.isValid():
+                if mode in required:
+                    invalid.append(f'{mode}: {Path(path).name}')
+                movie.deleteLater()
+                continue
+
+            movie.jumpToFrame(0)
+            frame = movie.currentPixmap()
+            if not frame.isNull():
+                if frame_rect.isNull():
+                    frame_rect = QRect(frame.rect())
+                visible = self._visible_rect(frame)
+                if visible.isValid() and not visible.isNull():
+                    visible_union = (
+                        QRect(visible) if visible_union.isNull()
+                        else visible_union.united(visible)
+                    )
+
+            movie.frameChanged.connect(lambda _frame: self.update())
+            movies[mode] = movie
+
+        if invalid or any(mode not in movies for mode in required):
+            for movie in movies.values():
+                movie.deleteLater()
+            return None, QRect(), invalid
+
+        # One crop rectangle for the whole operator, shared by m/r/s/in.
+        # Therefore switching action never changes the operator's physical scale.
+        if visible_union.isNull():
+            visible_union = QRect(frame_rect)
+        else:
+            pad = max(
+                6,
+                int(max(visible_union.width(), visible_union.height()) * 0.055)
+            )
+            visible_union = visible_union.adjusted(
+                -pad, -pad, pad, pad
+            ).intersected(frame_rect)
+
+        return movies, visible_union, []
+
+    def _discover_and_load_actors(self):
+        specs = self._discover_actor_sets()
+        invalid = []
+        count = max(1, len(specs))
+        for index, spec in enumerate(specs):
+            movies, source_rect, problems = self._make_movies(spec)
+            if not movies:
+                invalid.extend(f"{spec['id']}: {p}" for p in problems)
+                continue
+
+            profile = self._personality_for(spec['id'])
+            # Spread initial actors across the floor deterministically.
+            x = 0.16 + (0.68 * ((index * 0.61803398875) % 1.0))
+            depth = 0.34 + (0.46 * ((index * 0.38196601125 + 0.22) % 1.0))
+            actor = {
+                'id': spec['id'],
+                'display_name': profile.get('display_name', spec['id']),
+                'source': spec.get('source', ''),
+                'movies': movies,
+                'mode': None,
+                'source_rect': source_rect,
+                'x': x,
+                'depth': depth,
+                'facing': 1 if index % 2 == 0 else -1,
+                'sleeping': False,
+                'rect': QRectF(),
+                'profile': profile,
+                'target_x': x,
+                'target_depth': depth,
+                'target_reason': 'initial',
+                'target_actor_id': None,
+                'ai_timer': 0.0,
+                'rest_timer': 0.0,
+                'social_cooldown': 0.0,
+                'interaction_partner': None,
+                'interaction_timer': 0.0,
+                'interaction_mode': None,
+                'recent_social': {},
+                'post_social_roam_timer': 0.0,
+                'burst_timer': 0.0,
+                'move_speed': 0.0,
+                'perimeter_index': index % 4,
+                'perimeter_reverse': bool(index % 2),
+            }
+            self._actors.append(actor)
+            self._set_actor_mode(actor, 'relax')
+            self._choose_ai_target(actor, force=True)
+
+        if invalid:
+            self._asset_error = '; '.join(invalid)
+        if self._actors:
+            self._selected = 0
+
+    def _set_actor_mode(self, actor, mode):
+        if mode == actor.get('mode'):
+            return
+        old = actor.get('mode')
+        if old in actor['movies']:
+            actor['movies'][old].stop()
+        actor['mode'] = mode
+        movie = actor['movies'].get(mode)
+        if movie:
+            movie.start()
+
+    # ---------- AI ----------
+
+    @staticmethod
+    def _range_value(value, default):
+        try:
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
+                return random.uniform(float(value[0]), float(value[1]))
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _other_actors(self, actor):
+        return [other for other in self._actors
+                if other is not actor and not other.get('sleeping')]
+
+    @staticmethod
+    def _world_distance(a, b):
+        return math.hypot(a['x'] - b['x'], a['depth'] - b['depth'])
+
+    def _actor_identity_set(self, actor):
+        values = {
+            str(actor.get('id', '')).casefold(),
+            str(actor.get('display_name', '')).casefold(),
+        }
+        characters = self._personality_data.get('characters') or {}
+        for key, data in characters.items():
+            aliases = [str(a).casefold() for a in (data.get('aliases') or [])]
+            if actor.get('id', '').casefold() == str(key).casefold() or actor.get('id', '').casefold() in aliases:
+                values.add(str(key).casefold())
+                values.update(aliases)
+        return {v for v in values if v}
+
+    def _relationship(self, actor, other):
+        """Unknown or friendly-colleague relationships use the neutral weight 1."""
+        default_weight = float(
+            (self._personality_data.get('defaults') or {}).get('relationship_weight', 1.0) or 1.0)
+        relationships = self._personality_data.get('relationships') or {}
+        a_ids = self._actor_identity_set(actor)
+        b_ids = self._actor_identity_set(other)
+
+        def lookup(left_ids, right_ids):
+            for left in left_ids:
+                mapping = relationships.get(left) or relationships.get(left.casefold()) or {}
+                for right in right_ids:
+                    value = mapping.get(right) or mapping.get(right.casefold())
+                    if value is not None:
+                        return value
+            return None
+
+        data = lookup(a_ids, b_ids)
+        if data is None:
+            data = lookup(b_ids, a_ids)
+        if isinstance(data, (int, float)):
+            data = {'weight': float(data)}
+        data = dict(data or {})
+        data.setdefault('label', '友好同事/外人')
+        data.setdefault('weight', default_weight)
+        data['weight'] = max(0.05, float(data['weight']))
+        return data
+
+    def _weighted_social_choice(self, actor, others):
+        candidates, total = [], 0.0
+        recent = actor.get('recent_social') or {}
+        for other in others:
+            # A recently-socialized partner is temporarily excluded. This stops
+            # leave-return-interact loops while keeping the relationship intact.
+            if float(recent.get(other['id'], 0.0) or 0.0) > 0:
+                continue
+            relation = self._relationship(actor, other)
+            distance = max(0.04, self._world_distance(actor, other))
+            score = relation['weight'] / (0.18 + distance)
+            candidates.append((other, relation, score))
+            total += score
+
+        if total <= 0:
+            return None
+        pick = random.random() * total
+        for other, relation, score in candidates:
+            pick -= score
+            if pick <= 0:
+                return other, relation
+        return candidates[-1][0], candidates[-1][1]
+
+    def _social_target(self, actor):
+        profile = actor['profile']
+        if actor.get('social_cooldown', 0.0) > 0:
+            return None
+        if actor.get('post_social_roam_timer', 0.0) > 0:
+            return None
+
+        others = self._other_actors(actor)
+        if not others:
+            return None
+
+        # Crowd avoidance is evaluated before attraction.
+        crowd_radius = float(profile.get('crowd_radius', 0.28) or 0.28)
+        nearby = [o for o in others if self._world_distance(actor, o) <= crowd_radius]
+        avoidance = float(profile.get('crowd_avoidance', 0.0) or 0.0)
+        if nearby and random.random() < avoidance:
+            cx = sum(o['x'] for o in nearby) / len(nearby)
+            cd = sum(o['depth'] for o in nearby) / len(nearby)
+            vx, vd = actor['x'] - cx, actor['depth'] - cd
+            mag = max(0.001, math.hypot(vx, vd))
+            push = float(profile.get('avoidance_distance', 0.30) or 0.30)
+            actor['target_actor_id'] = None
+            return (
+                max(0.10, min(0.90, actor['x'] + vx / mag * push)),
+                max(0.14, min(0.90, actor['depth'] + vd / mag * push)),
+                'avoid',
+            )
+
+        picked = self._weighted_social_choice(actor, others)
+        if not picked:
+            return None
+        other, relation = picked
+        weight = relation['weight']
+
+        # Sociality is a possible goal, not the default goal. Relationship weight
+        # modifies the chance, but even highly social actors continue normal movement.
+        base_goal = float(profile.get('social_goal_chance', 0.12) or 0.12)
+        relation_gain = float(profile.get('relationship_goal_gain', 0.55) or 0.55)
+        chance = base_goal * (1.0 + relation_gain * max(0.0, weight - 1.0))
+        chance = min(float(profile.get('max_social_goal_chance', 0.48) or 0.48), chance)
+        if random.random() >= chance:
+            return None
+
+        preferred = float(profile.get('preferred_social_distance', 0.18) or 0.18)
+        preferred /= max(0.86, min(1.28, weight ** 0.16))
+        if self._world_distance(actor, other) <= preferred * 0.70:
+            return None
+
+        jitter = float(profile.get('social_jitter', 0.05) or 0.05)
+        actor['target_actor_id'] = other['id']
+        return (
+            max(0.10, min(0.90, other['x'] + random.uniform(-jitter, jitter))),
+            max(0.14, min(0.90, other['depth'] + random.uniform(-jitter, jitter))),
+            'social',
+        )
+
+    def _actor_by_id(self, actor_id):
+        for actor in self._actors:
+            if actor.get('id') == actor_id:
+                return actor
+        return None
+
+    def _social_duration(self, actor, other):
+        a = self._range_value(actor['profile'].get('social_duration'), 1.8)
+        b = self._range_value(other['profile'].get('social_duration'), 1.8)
+        weight = self._relationship(actor, other)['weight']
+        return max(0.7, ((a + b) * 0.5) * min(1.45, 0.90 + 0.16 * weight))
+
+    def _start_social_interaction(self, actor, other):
+        if actor is other or actor.get('sleeping') or other.get('sleeping'):
+            return False
+        if actor.get('interaction_partner') or other.get('interaction_partner'):
+            return False
+        if self._selected >= 0:
+            selected = self._actors[self._selected]
+            if selected in (actor, other) and self._keys:
+                return False
+
+        relation = self._relationship(actor, other)
+        base = float(actor['profile'].get('interaction_chance', 0.55) or 0.55)
+        chance = min(0.90, base * max(0.65, min(1.45, relation['weight'])))
+        if random.random() > chance:
+            return False
+
+        duration = self._social_duration(actor, other)
+        actor['interaction_partner'] = other['id']
+        other['interaction_partner'] = actor['id']
+        actor['interaction_timer'] = duration
+        other['interaction_timer'] = duration
+        actor['target_actor_id'] = None
+        other['target_actor_id'] = None
+        actor['facing'] = 1 if other['x'] >= actor['x'] else -1
+        other['facing'] = 1 if actor['x'] >= other['x'] else -1
+
+        # During a social encounter, each actor uses normal relax 80% of the time
+        # and its dedicated _in animation 20% of the time.
+        for participant in (actor, other):
+            use_in = ('social' in participant['movies'] and random.random() < 0.20)
+            participant['interaction_mode'] = 'social' if use_in else 'relax'
+            self._set_actor_mode(participant, participant['interaction_mode'])
+        return True
+
+    def _end_social_interaction(self, actor):
+        partner_id = actor.get('interaction_partner')
+        partner = self._actor_by_id(partner_id) if partner_id else None
+        pair = [actor] + ([partner] if partner is not None else [])
+
+        # Relationship remains meaningful, but this pair now gets a substantial
+        # temporary memory cooldown so they do not immediately separate and reunite.
+        for participant in pair:
+            other = partner if participant is actor else actor
+            if other is not None:
+                cooldown = self._range_value(
+                    participant['profile'].get('repeat_partner_cooldown'), 16.0)
+                participant.setdefault('recent_social', {})[other['id']] = cooldown
+
+            participant['interaction_partner'] = None
+            participant['interaction_timer'] = 0.0
+            participant['interaction_mode'] = None
+            participant['social_cooldown'] = self._range_value(
+                participant['profile'].get('social_cooldown'), 5.0)
+            participant['post_social_roam_timer'] = self._range_value(
+                participant['profile'].get('post_social_roam'), 7.0)
+            self._set_actor_mode(participant, 'relax')
+
+            # Personality-specific departure bursts remain possible, but are not guaranteed.
+            chance = float(
+                participant['profile'].get('burst_after_social_chance', 0.0) or 0.0)
+            if random.random() < chance:
+                participant['burst_timer'] = self._range_value(
+                    participant['profile'].get('burst_duration'), 1.5)
+
+            # Force a normal non-social destination next.
+            participant['target_actor_id'] = None
+            participant['ai_timer'] = 0.0
+
+    def _maybe_observe(self, actor):
+        profile = actor['profile']
+        chance = float(profile.get('observe_chance', 0.0) or 0.0)
+        if chance <= 0 or random.random() >= chance:
+            return False
+        others = self._other_actors(actor)
+        if not others:
+            return False
+        radius = float(profile.get('observe_radius', 0.30) or 0.30)
+        visible = [o for o in others if self._world_distance(actor, o) <= radius]
+        if not visible:
+            return False
+        nearest = min(visible, key=lambda o: self._world_distance(actor, o))
+        actor['facing'] = 1 if nearest['x'] > actor['x'] else -1
+        actor['rest_timer'] = self._range_value(profile.get('observe_duration'), 2.4)
+        self._set_actor_mode(actor, 'relax')
+        return True
+
+    def _choose_behavior_style(self, profile):
+        mix = profile.get('behavior_mix')
+        if isinstance(mix, dict) and mix:
+            weighted = []
+            total = 0.0
+            for name, weight in mix.items():
+                try:
+                    value = max(0.0, float(weight))
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    weighted.append((str(name).lower(), value))
+                    total += value
+            if total > 0:
+                pick = random.random() * total
+                for name, weight in weighted:
+                    pick -= weight
+                    if pick <= 0:
+                        return name
+                return weighted[-1][0]
+        return str(profile.get('behavior', 'wander')).lower()
+
+    def _choose_ai_target(self, actor, force=False):
+        profile = actor['profile']
+        if not force and actor['rest_timer'] > 0:
+            return
+
+        actor['target_actor_id'] = None
+
+        social = self._social_target(actor)
+        if social is not None:
+            actor['target_x'], actor['target_depth'], actor['target_reason'] = social
+        else:
+            behavior = self._choose_behavior_style(profile)
+
+            if behavior == 'perimeter':
+                corners = [(0.12, 0.18), (0.88, 0.18),
+                           (0.88, 0.88), (0.12, 0.88)]
+                idx = actor['perimeter_index'] % 4
+                actor['target_x'], actor['target_depth'] = corners[idx]
+                actor['target_reason'] = 'perimeter'
+
+            elif behavior in ('drifter', 'drift'):
+                actor['target_x'] = 0.84 if actor['x'] < 0.5 else 0.16
+                bias = float(profile.get('depth_bias', 0.58))
+                variance = float(profile.get('depth_variance', 0.18))
+                actor['target_depth'] = max(
+                    0.16, min(0.88, random.uniform(bias - variance, bias + variance)))
+                actor['target_reason'] = 'drift'
+
+            elif behavior == 'patrol':
+                actor['target_x'] = random.choice((0.18, 0.82))
+                bias = float(profile.get('depth_bias', 0.56))
+                variance = float(profile.get('depth_variance', 0.24))
+                actor['target_depth'] = max(
+                    0.16, min(0.88, random.uniform(bias - variance, bias + variance)))
+                actor['target_reason'] = 'patrol'
+
+            elif behavior == 'local_wander':
+                # Small nearby displacement; useful for active characters who
+                # frequently change their mind without crossing the whole room.
+                actor['target_x'] = max(
+                    0.12, min(0.88, actor['x'] + random.uniform(-0.22, 0.22)))
+                actor['target_depth'] = max(
+                    0.14, min(0.90, actor['depth'] + random.uniform(-0.18, 0.18)))
+                actor['target_reason'] = 'local_wander'
+
+            else:  # wander
+                actor['target_x'] = random.uniform(0.12, 0.88)
+                bias = float(profile.get('depth_bias', 0.58))
+                variance = float(profile.get('depth_variance', 0.32))
+                actor['target_depth'] = max(
+                    0.14, min(0.90, random.uniform(bias - variance, bias + variance)))
+                actor['target_reason'] = 'wander'
+
+        actor['ai_timer'] = self._range_value(
+            profile.get('turn_interval'), 3.5)
+        actor['move_speed'] = self._range_value(
+            profile.get('speed'), 0.09)
+
+    def _tick_ai(self, actor, dt):
+        if actor['sleeping']:
+            if actor.get('interaction_partner'):
+                self._end_social_interaction(actor)
+            self._set_actor_mode(actor, 'sleep')
+            return
+
+        actor['social_cooldown'] = max(
+            0.0, actor.get('social_cooldown', 0.0) - dt)
+        actor['post_social_roam_timer'] = max(
+            0.0, actor.get('post_social_roam_timer', 0.0) - dt)
+        actor['burst_timer'] = max(
+            0.0, actor.get('burst_timer', 0.0) - dt)
+
+        recent = actor.get('recent_social') or {}
+        for partner_id in list(recent):
+            recent[partner_id] = max(0.0, float(recent[partner_id]) - dt)
+            if recent[partner_id] <= 0:
+                recent.pop(partner_id, None)
+
+        if actor.get('interaction_partner'):
+            actor['interaction_timer'] = max(
+                0.0, actor.get('interaction_timer', 0.0) - dt)
+            partner = self._actor_by_id(actor['interaction_partner'])
+            if actor['interaction_timer'] <= 0 or partner is None:
+                self._end_social_interaction(actor)
+            else:
+                mode = actor.get('interaction_mode') or 'relax'
+                if mode not in actor['movies']:
+                    mode = 'relax'
+                self._set_actor_mode(actor, mode)
+            return
+
+        if actor['rest_timer'] > 0:
+            before = actor['rest_timer']
+            actor['rest_timer'] = max(0.0, actor['rest_timer'] - dt)
+            self._set_actor_mode(actor, 'relax')
+            if before > 0 and actor['rest_timer'] <= 0:
+                chance = float(
+                    actor['profile'].get('burst_after_pause_chance', 0.0) or 0.0)
+                if random.random() < chance:
+                    actor['burst_timer'] = self._range_value(
+                        actor['profile'].get('burst_duration'), 1.3)
+            return
+
+        actor['ai_timer'] -= dt
+        dx = actor['target_x'] - actor['x']
+        dd = actor['target_depth'] - actor['depth']
+        distance = math.hypot(dx, dd)
+
+        if actor.get('target_reason') == 'social' and actor.get('target_actor_id'):
+            other = self._actor_by_id(actor['target_actor_id'])
+            if other is not None:
+                trigger = float(
+                    actor['profile'].get('interaction_distance', 0.095) or 0.095)
+                if self._world_distance(actor, other) <= trigger:
+                    if self._start_social_interaction(actor, other):
+                        return
+                    actor['social_cooldown'] = self._range_value(
+                        actor['profile'].get('social_cooldown'), 4.0)
+                    actor['target_actor_id'] = None
+                    actor['ai_timer'] = 0.0
+
+        if distance < 0.025 or actor['ai_timer'] <= 0:
+            profile = actor['profile']
+            if self._maybe_observe(actor):
+                return
+            if random.random() < float(profile.get('rest_chance', 0.1)):
+                actor['rest_timer'] = self._range_value(
+                    profile.get('rest_duration'), 1.5)
+                self._set_actor_mode(actor, 'relax')
+                return
+            if (actor.get('target_reason') == 'perimeter'
+                    and distance < 0.05):
+                step = -1 if actor.get('perimeter_reverse') else 1
+                actor['perimeter_index'] = (
+                    actor['perimeter_index'] + step) % 4
+            self._choose_ai_target(actor, force=True)
+            dx = actor['target_x'] - actor['x']
+            dd = actor['target_depth'] - actor['depth']
+            distance = max(0.0001, math.hypot(dx, dd))
+
+        speed = float(
+            actor.get('move_speed')
+            or self._range_value(actor['profile'].get('speed'), 0.09)
+        )
+        speed *= float(actor['profile'].get('speed_multiplier', 1.0))
+        if actor.get('burst_timer', 0.0) > 0:
+            speed *= float(
+                actor['profile'].get('burst_multiplier', 1.6) or 1.6)
+
+        amount = min(distance, speed * dt)
+        if distance > 0:
+            actor['x'] += (dx / distance) * amount
+            actor['depth'] += (dd / distance) * amount
+            if abs(dx) > 0.002:
+                actor['facing'] = 1 if dx > 0 else -1
+        self._set_actor_mode(actor, 'move')
+
+    def _tick_selected(self, actor, dt):
+        if actor['sleeping']:
+            self._keys.clear()
+            self._set_actor_mode(actor, 'sleep')
+            return
+
+        moving = bool(self._keys & {Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D})
+        if moving and actor.get('interaction_partner'):
+            self._end_social_interaction(actor)
+        if not moving:
+            if actor.get('interaction_partner'):
+                mode = actor.get('interaction_mode') or 'relax'
+                if mode not in actor['movies']:
+                    mode = 'relax'
+                self._set_actor_mode(actor, mode)
+            else:
+                self._set_actor_mode(actor, 'relax')
+            return
+
+        speed = self._range_value(actor['profile'].get('speed'), 0.10)
+        speed *= max(1.0, float(actor['profile'].get('speed_multiplier', 1.0)))
+        manual = max(0.105, speed * 1.15)
+        depth_speed = manual * 0.88
+
+        if Qt.Key_A in self._keys:
+            actor['x'] -= manual * dt
+            actor['facing'] = -1
+        if Qt.Key_D in self._keys:
+            actor['x'] += manual * dt
+            actor['facing'] = 1
+        if Qt.Key_W in self._keys:
+            actor['depth'] -= depth_speed * dt
+        if Qt.Key_S in self._keys:
+            actor['depth'] += depth_speed * dt
+        self._set_actor_mode(actor, 'move')
+
+    def _tick(self):
+        dt = self._clock.interval() / 1000.0
+        for index, actor in enumerate(self._actors):
+            if index == self._selected:
+                self._tick_selected(actor, dt)
+            else:
+                self._tick_ai(actor, dt)
+
+            # Invisible collision planes.
+            # Invisible collision planes in normalized world coordinates.
+            actor['x'] = max(0.07, min(0.93, actor['x']))
+            actor['depth'] = max(0.10, min(0.93, actor['depth']))
+
+        self.update()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            if 0 <= self._selected < len(self._actors) and not self._actors[self._selected]['sleeping']:
+                self._keys.add(event.key())
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        self._keys.discard(event.key())
+        if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _actor_at(self, point):
+        # Near actors are visually on top, so test from nearest to farthest.
+        order = sorted(range(len(self._actors)), key=lambda i: self._actors[i]['depth'], reverse=True)
+        for index in order:
+            if self._actors[index]['rect'].contains(point):
+                return index
+        return -1
+
+    def mousePressEvent(self, event):
+        self.setFocus(Qt.MouseFocusReason)
+        hit = self._actor_at(event.position())
+
+        if event.button() == Qt.LeftButton and hit >= 0:
+            self._selected = hit
+            self._keys.clear()
+            self.update()
+            event.accept()
+            return
+
+        if event.button() == Qt.RightButton and hit >= 0:
+            actor = self._actors[hit]
+            menu = QMenu(self)
+            action = menu.addAction(
+                TXT('把她叫醒', 'Wake up') if actor['sleeping']
+                else TXT('让她睡觉', 'Let sleep')
+            )
+            chosen = menu.exec(event.globalPosition().toPoint())
+            if chosen is action:
+                actor['sleeping'] = not actor['sleeping']
+                if hit == self._selected:
+                    self._keys.clear()
+                self._set_actor_mode(actor, 'sleep' if actor['sleeping'] else 'relax')
+                if not actor['sleeping'] and hit != self._selected:
+                    self._choose_ai_target(actor, force=True)
+            event.accept()
+            return
+
+        super().mousePressEvent(event)
+
+    # ---------- room projection ----------
+
+    def _room_geometry(self):
+        """Return a pseudo-3D room whose far end is a rectangular wall."""
+        w, h = float(self.width()), float(self.height())
+        return {
+            'front_left': w * 0.045,
+            'front_right': w * 0.955,
+            'floor_bottom': h * 0.965,
+            'back_left': w * 0.255,
+            'back_right': w * 0.745,
+            'back_top': h * 0.085,
+            'back_bottom': h * 0.355,
+        }
+
+    def _floor_bounds_at_depth(self, depth):
+        room = self._room_geometry()
+        t = max(0.0, min(1.0, float(depth)))
+        left = room['back_left'] + (room['front_left'] - room['back_left']) * t
+        right = room['back_right'] + (room['front_right'] - room['back_right']) * t
+        return left, right
+
+    def _ground_y_at_depth(self, depth):
+        room = self._room_geometry()
+        t = max(0.0, min(1.0, float(depth)))
+        return room['back_bottom'] + (room['floor_bottom'] - room['back_bottom']) * (t ** 1.72)
+
+    def _draw_grid(self, painter):
+        day = ACTIVE_THEME == 'day'
+        bg = QColor('#eef8ff' if day else '#06080b')
+        wall_fill = QColor('#e7f4fd' if day else '#090d12')
+        floor_fill = QColor('#edf8ff' if day else '#070a0e')
+        major = QColor(35, 145, 220, 125) if day else QColor(195, 210, 230, 82)
+        minor = QColor(60, 165, 225, 58) if day else QColor(145, 160, 180, 42)
+
+        painter.fillRect(self.rect(), bg)
+        room = self._room_geometry()
+        bl, br = room['back_left'], room['back_right']
+        bt, bb = room['back_top'], room['back_bottom']
+        fl, fr = room['front_left'], room['front_right']
+        fb = room['floor_bottom']
+
+        # Real rectangular back wall.
+        back_wall = QRectF(bl, bt, br - bl, bb - bt)
+        painter.fillRect(back_wall, wall_fill)
+
+        floor = QPainterPath()
+        floor.moveTo(bl, bb)
+        floor.lineTo(br, bb)
+        floor.lineTo(fr, fb)
+        floor.lineTo(fl, fb)
+        floor.closeSubpath()
+        painter.fillPath(floor, floor_fill)
+
+        cols, rows = 10, 6
+        for i in range(cols + 1):
+            x = bl + (br - bl) * i / cols
+            painter.setPen(QPen(major if i % 5 == 0 else minor, 1))
+            painter.drawLine(QPointF(x, bt), QPointF(x, bb))
+        for i in range(rows + 1):
+            y = bt + (bb - bt) * i / rows
+            painter.setPen(QPen(major if i % 3 == 0 else minor, 1))
+            painter.drawLine(QPointF(bl, y), QPointF(br, y))
+
+        floor_cols = 14
+        for i in range(floor_cols + 1):
+            u = i / floor_cols
+            back_x = bl + (br - bl) * u
+            front_x = fl + (fr - fl) * u
+            painter.setPen(QPen(major if i % 2 == 0 else minor, 1))
+            painter.drawLine(QPointF(back_x, bb), QPointF(front_x, fb))
+
+        depth_rows = 14
+        for i in range(depth_rows + 1):
+            t = i / depth_rows
+            y = bb + (fb - bb) * (t ** 1.72)
+            left = bl + (fl - bl) * t
+            right = br + (fr - br) * t
+            painter.setPen(QPen(major if i % 3 == 0 else minor, 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+
+        # Side-room structure; collision planes themselves are never drawn.
+        painter.setPen(QPen(major, 1))
+        painter.drawLine(QPointF(bl, bt), QPointF(fl, 0.0))
+        painter.drawLine(QPointF(br, bt), QPointF(fr, 0.0))
+        painter.drawLine(QPointF(bl, bb), QPointF(fl, fb))
+        painter.drawLine(QPointF(br, bb), QPointF(fr, fb))
+
+        for i in range(1, 6):
+            t = i / 6.0
+            top_l = QPointF(bl + (fl - bl) * t, bt * (1.0 - t))
+            bottom_l = QPointF(bl + (fl - bl) * t, bb + (fb - bb) * (t ** 1.72))
+            top_r = QPointF(br + (fr - br) * t, bt * (1.0 - t))
+            bottom_r = QPointF(br + (fr - br) * t, bb + (fb - bb) * (t ** 1.72))
+            painter.setPen(QPen(minor, 1))
+            painter.drawLine(top_l, bottom_l)
+            painter.drawLine(top_r, bottom_r)
+
+    # ---------- painting ----------
+
+    def _world_scale_at_depth(self, depth):
+        """Perspective scale shared by every operator at the same depth.
+
+        depth=0 is the back wall; depth=1 is the near edge of the floor.
+        The scale is derived from the room's visible floor width so actor size,
+        horizontal movement and the grid all use the same coordinate system.
+        """
+        depth = max(0.0, min(1.0, float(depth)))
+        room = self._room_geometry()
+        back_width = max(1.0, room['back_right'] - room['back_left'])
+        front_width = max(1.0, room['front_right'] - room['front_left'])
+        left, right = self._floor_bounds_at_depth(depth)
+        width_here = max(1.0, right - left)
+
+        # Normalize the room width to 0..1 perspective progress.
+        denom = max(1.0, front_width - back_width)
+        perspective = max(0.0, min(1.0, (width_here - back_width) / denom))
+
+        # Far actors are still readable; near actors become substantially larger.
+        return 0.46 + 0.54 * perspective
+
+    def _world_actor_height(self, depth):
+        """Pixel height of a standard operator at a given world depth."""
+        base_near_height = min(300.0, max(230.0, self.height() * 0.34))
+        return base_near_height * self._world_scale_at_depth(depth)
+
+    def _actor_destination(self, actor):
+        source = actor.get('source_rect') or QRect()
+        if source.isNull() or source.height() <= 0:
+            return QRectF()
+
+        # IMPORTANT: all operators at the same depth receive exactly the same
+        # visual height. Source GIF dimensions only determine aspect ratio.
+        actor_h = self._world_actor_height(actor['depth'])
+        actor_w = actor_h * source.width() / max(1.0, source.height())
+
+        ground_y = self._ground_y_at_depth(actor['depth'])
+        left_bound, right_bound = self._floor_bounds_at_depth(actor['depth'])
+        center_x = left_bound + (right_bound - left_bound) * actor['x']
+
+        return QRectF(
+            center_x - actor_w / 2.0,
+            ground_y - actor_h,
+            actor_w,
+            actor_h,
+        )
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self._draw_grid(painter)
+
+        if not self._actors:
+            painter.setPen(QColor('#53657d' if ACTIVE_THEME == 'day' else '#aeb8c8'))
+            message = self._asset_error or TXT(
+                'resource/gif 中未发现完整动画包',
+                'No complete animation pack found under resource/gif')
+            painter.drawText(self.rect().adjusted(40, 40, -40, -40),
+                             Qt.AlignCenter | Qt.TextWordWrap, message)
+            return
+
+        # Far actors first, near actors last.
+        order = sorted(range(len(self._actors)), key=lambda i: self._actors[i]['depth'])
+        for index in order:
+            actor = self._actors[index]
+            movie = actor['movies'].get(actor['mode'])
+            frame = movie.currentPixmap() if movie else QPixmap()
+            if frame.isNull():
+                actor['rect'] = QRectF()
+                continue
+
+            source = QRectF(actor['source_rect'])
+            dest = self._actor_destination(actor)
+            actor['rect'] = dest
+
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            if actor['facing'] < 0:
+                painter.translate(dest.center().x() * 2, 0)
+                painter.scale(-1, 1)
+            painter.drawPixmap(dest, frame, source)
+            painter.restore()
+
+
+class PlaygroundPage(QWidget):
+    backRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 20, 28, 24)
+        header = QHBoxLayout()
+        self.back_btn = FloatingButton(TXT('← 返回主页', '← Back Home'))
+        self.back_btn.clicked.connect(self.backRequested)
+        header.addWidget(self.back_btn)
+        title = QLabel(TXT('游乐场', 'Playground'))
+        title.setStyleSheet('font-size:24px; font-weight:700;')
+        header.addWidget(title)
+        header.addStretch()
+        hint = QLabel(TXT('左键选择角色 · WASD 移动 · 右键：睡觉/叫醒', 'Left-click to select · WASD move · Right-click: sleep/wake'))
+        header.addWidget(hint)
+        outer.addLayout(header)
+        self.canvas = PlaygroundCanvas(self)
+        outer.addWidget(self.canvas, 1)
 
 class MusicPage(QWidget):
     def __init__(self, parent=None):
@@ -1301,6 +2400,12 @@ class MusicPage(QWidget):
             self.prts_cache = json.loads(self.prts_cache_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.prts_cache = {}
+        self.search_index_file = PREFERENCE_DIR / 'prts_music_index.json'
+        try:
+            cached_index = json.loads(self.search_index_file.read_text(encoding='utf-8'))
+            self.music_search_index = cached_index if isinstance(cached_index, dict) else {}
+        except (OSError, ValueError):
+            self.music_search_index = {}
         self.current_index = -1
         self.current_lyrics = []
         self.current_lyric_index = -1
@@ -1342,10 +2447,11 @@ class MusicPage(QWidget):
         self.daily_timer.start()
         QTimer.singleShot(0, self.reload_library)
         QTimer.singleShot(100, self._load_online_catalogue)
+        QTimer.singleShot(150, self._refresh_music_search_index)
 
     def _submit(self, kind, fn, *args):
         queue = (self.media_executor if kind.startswith(("audio:", "save:")) else
-                 self.metadata_executor if kind.startswith(("credits:", "catalogue", "wiki:")) else self.executor)
+                 self.metadata_executor if kind.startswith(("credits:", "catalogue", "wiki:", "music_index")) else self.executor)
         future = queue.submit(fn, *args)
         def deliver(done):
             try:
@@ -1366,6 +2472,10 @@ class MusicPage(QWidget):
         except (OSError, ValueError):
             pass
         self._submit("catalogue", siren.catalogue)
+
+    def _refresh_music_search_index(self):
+        # Keep the cached associations usable offline and update them in one request.
+        self._submit('music_index', siren.music_search_index)
 
     def _install_online_catalogue(self, songs):
         if not isinstance(songs, list) or not songs:
@@ -1417,6 +2527,14 @@ class MusicPage(QWidget):
         return True
 
     def _network_done(self, kind, value, error):
+        if kind == 'music_index':
+            if not error and isinstance(value, dict) and value:
+                self.music_search_index = value
+                _write_json(self.search_index_file, value)
+                if self.source_kind == 'online' and self.search_box.text().strip():
+                    self._rebuild_playlist()
+                self._refresh_daily_song()
+            return
         if kind.startswith('daily_intro:'):
             cid = kind.split(':', 1)[1]
             if not error and isinstance(value, dict):
@@ -1509,6 +2627,8 @@ class MusicPage(QWidget):
             for track in (*self.online_tracks, *self.local_tracks):
                 if self._credits_key(track) == key:
                     self._apply_credits(track, value if isinstance(value, dict) else {})
+            if key == getattr(self, 'home_daily_cid', None):
+                self._refresh_daily_song()
             if self._pending_metadata_save == key:
                 self._pending_metadata_save = None
                 if 0 <= self.current_index < len(self.tracks) and self._credits_key(self.tracks[self.current_index]) == key:
@@ -1531,6 +2651,7 @@ class MusicPage(QWidget):
                         row.sync_download_state()
             self.scan_status.setText((TXT("保存失败：", "Save failed: ") + error[:150]) if error else
                                      TXT(f"已保存：{value.name}", f"Saved: {value.name}"))
+
 
     def _apply_credits(self, track, credits):
         if credits:
@@ -1696,6 +2817,11 @@ class MusicPage(QWidget):
         self.home_daily_play.setText(TXT('播放今日推荐  ▶', 'Play Today’s Pick  ▶'))
         self.home_news_heading.setText(TXT('每日药闻', 'Daily Pharmaceutical News'))
         self.home_liked_heading.setText(TXT('22N7O 喜欢听的', '22N7O’s Favorites'))
+        self.home_playground_heading.setText(TXT('游乐场', 'Playground'))
+        self.home_playground_note.setText(TXT('请君入园·依律镇抚', 'Ingredere hortum · lege compesce'))
+        self.home_playground_button.setText(TXT('进入游乐场  ↗', 'Enter Playground  ↗'))
+        if hasattr(self, 'playground_page'):
+            self.playground_page.back_btn.setText(TXT('← 返回主页', '← Back Home'))
         self.home_guide.setText(TXT('打开使用指南', 'Open User Guide'))
         self._refresh_daily_song()
         for label, zh, en in self._localized_labels:
@@ -1726,7 +2852,7 @@ class MusicPage(QWidget):
         self.open_preference_btn.setText(TXT("打开偏好设置文件夹", "Open Preferences Folder"))
         self.source_combo.setItemText(0, TXT("塞壬唱片 · 在线", "Monster Siren · Online"))
         self.source_combo.setItemText(1, TXT("本地音乐", "Local Music"))
-        self.search_box.setPlaceholderText(TXT("搜索歌曲或专辑…", "Search tracks or albums…"))
+        self.search_box.setPlaceholderText(TXT("搜索歌曲、干员 EP 或活动 OST…", "Search tracks, operator EPs or event OSTs…"))
         self.save_online_btn.setText(TXT("保存到本地", "Save Locally"))
         self.compress_check.setText(TXT("后台转为 MP3 并压缩", "Convert to MP3 in background"))
         self.clear_cache_btn.setText(TXT("一键清理临时歌曲缓存", "Clear Temporary Song Cache"))
@@ -1776,6 +2902,7 @@ class MusicPage(QWidget):
         ACTIVE_THEME = self._effective_theme()
         _STAR_CACHE.clear()
         QApplication.instance().setStyleSheet(theme_css(STYLE))
+        QTimer.singleShot(0, self._update_playground_art)
         self._rebuild_playlist()
         if 0 <= self.current_index < len(self.tracks):
             track = self.tracks[self.current_index]
@@ -2217,6 +3344,8 @@ class MusicPage(QWidget):
         self.main_stack.addWidget(self._build_player_view())
         self.main_stack.addWidget(self._build_settings_view())
         self.main_stack.addWidget(self._build_home_view())
+        self.main_stack.addWidget(self._build_playground_view())
+        self._page_before_settings = 2
         self.home_btn = FloatingButton(TXT("主页", "Home"))
         self.home_btn.clicked.connect(lambda: self.main_stack.setCurrentIndex(2))
         top.insertWidget(1, self.home_btn)
@@ -2273,8 +3402,7 @@ class MusicPage(QWidget):
         layout.addWidget(banner)
 
         daily, daily_layout, self.home_daily_heading = self._home_panel(
-            TXT('今日舟乐推荐', 'Today’s Arknights Track'), artwork=True)
-        daily.setProperty('thumbnailStart', 0.52)
+            TXT('今日舟乐推荐', 'Today’s Arknights Track'))
         daily.setMinimumHeight(225)
         daily_row = QHBoxLayout()
         self.home_daily_cover = QLabel()
@@ -2334,6 +3462,38 @@ class MusicPage(QWidget):
         liked_layout.addStretch()
         bottom.addWidget(liked, 1)
         layout.addLayout(bottom)
+
+        self.home_playground = ClickableHomePanel()
+        self.home_playground.setObjectName('homePanel')
+        self.home_playground.setCursor(Qt.PointingHandCursor)
+        self.home_playground.setMinimumHeight(220)
+        self.home_playground.setStyleSheet(
+            'QFrame#homePanel { background:#15181f; border:1px solid #303742; border-radius:24px; }')
+        pg_layout = QHBoxLayout(self.home_playground)
+        pg_layout.setContentsMargins(25, 20, 25, 20)
+        pg_text = QVBoxLayout()
+        self.home_playground_heading = QLabel(TXT('游乐场', 'Playground'))
+        self.home_playground_heading.setStyleSheet('font-size:22px; font-weight:700; background:transparent; border:0;')
+        pg_text.addWidget(self.home_playground_heading)
+        self.home_playground_note = QLabel(TXT(
+            '请君入园·依律镇抚',
+            'Ingredere hortum · lege compesce'))
+        self.home_playground_note.setWordWrap(True)
+        self.home_playground_note.setStyleSheet('background:transparent; border:0;')
+        pg_text.addWidget(self.home_playground_note)
+        pg_text.addStretch()
+        self.home_playground_button = FloatingButton(TXT('进入游乐场  ↗', 'Enter Playground  ↗'))
+        self.home_playground_button.clicked.connect(self._open_playground)
+        pg_text.addWidget(self.home_playground_button, 0, Qt.AlignLeft)
+        pg_layout.addLayout(pg_text, 1)
+        self.home_playground_art = CoverImageLabel()
+        self.home_playground_art.setMinimumSize(430, 165)
+        self.home_playground_art.setAlignment(Qt.AlignCenter)
+        self.home_playground_art.setStyleSheet('background:transparent; border:0;')
+        pg_layout.addWidget(self.home_playground_art, 1)
+        self.home_playground.clicked.connect(self._open_playground)
+        layout.addWidget(self.home_playground)
+        self._update_playground_art()
         self.home_guide = FloatingButton(TXT('打开使用指南', 'Open User Guide'))
         self.home_guide.clicked.connect(self._show_guide)
         layout.addWidget(self.home_guide, 0, Qt.AlignRight)
@@ -2341,10 +3501,79 @@ class MusicPage(QWidget):
         page.setWidget(host)
         return page
 
+    def _update_playground_art(self):
+        if not hasattr(self, 'home_playground_art'):
+            return
+        name = 'day_theme.png' if ACTIVE_THEME == 'day' else 'night_theme.png'
+        path = RESOURCE_PIC_DIR / name
+        pix = QPixmap(str(path)) if path.is_file() else QPixmap()
+        if pix.isNull():
+            self.home_playground_art.clearSourcePixmap()
+            self.home_playground_art.setText(TXT('游乐场配图 · 待添加', 'Playground artwork · missing'))
+            return
+        self.home_playground_art.setText('')
+        self.home_playground_art.setSourcePixmap(pix)
+
+    def _open_playground(self):
+        self.main_stack.setCurrentIndex(3)
+        if hasattr(self, 'playground_page'):
+            self.playground_page.canvas.setFocus(Qt.OtherFocusReason)
+
+    def _build_playground_view(self):
+        self.playground_page = PlaygroundPage(self)
+        self.playground_page.backRequested.connect(lambda: self.main_stack.setCurrentIndex(2))
+        return self.playground_page
+
     def _show_guide(self):
-        QMessageBox.information(self, TXT('Velia 使用指南', 'Velia User Guide'), TXT(
-            '主页可进入明日方舟音乐库，并查看每日推荐。播放器左侧搜索曲目、收藏歌曲和管理分类；点击专辑可展开曲目。右侧控制播放及查看歌词。设置可切换主题、语言、音频压缩选项与桌面歌词位置。音乐保存在 local/music，个人偏好保存在 local/preferences。',
-            'Enter the Monster Siren library or see the daily recommendation on Home. Search, favorite and organize tracks on the left; click an album to expand it. The right side controls playback and lyrics. Settings include theme, language, audio compression and desktop lyric placement. Music lives in local/music and preferences in local/preferences.'))
+        if getattr(self, 'guide_window', None) is not None and self.guide_window.isVisible():
+            self.guide_window.raise_()
+            self.guide_window.activateWindow()
+            return
+        guide = QDialog(self)
+        guide.setWindowTitle(TXT('Velia 使用指南', 'Velia User Guide'))
+        guide.setWindowFlag(Qt.Window, True)
+        guide.resize(690, 570)
+        outer = QVBoxLayout(guide)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(24, 20, 24, 24)
+        body.setSpacing(13)
+        sections = [
+            (TXT('主页', 'Home'), TXT(
+                '点击“前往明日方舟音乐库”进入播放器。今日舟乐每天推荐一首曲目；每日药闻和 22N7O 喜欢听的目前为占位内容。',
+                'Enter the Monster Siren library from Home. Today’s Pick recommends one track per day; the other two panels are placeholders.')),
+            (TXT('搜索与分类', 'Search and Categories'), TXT(
+                '在播放器搜索框输入曲名、专辑或艺术家；还可输入干员名称查找对应 EP，输入活动名称查找关联 OST。首次联网时会在后台更新 PRTS 索引，之后可使用本地缓存。点击专辑展开曲目；用五角星收藏，用文件夹管理分类。',
+                'Search by title, album or artist. Enter an operator name for related EPs, or an event name for related OSTs. The PRTS search index updates in the background and remains cached. Expand albums with a click; use stars and folders for favorites and categories.')),
+            (TXT('播放与保存', 'Playback and Saving'), TXT(
+                '在线曲目首次播放会下载到临时缓存；“保存到本地”会将歌曲整理至 local/music。关闭时清理临时歌曲缓存，也可在设置中手动清理。',
+                'Online songs download to a temporary cache on first play. Save Locally places music in local/music. Temporary audio is cleared on exit or with the settings button.')),            (TXT('游乐场', 'Playground'), TXT(
+                '游乐场会扫描 resource/gif 中所有 ZIP 与 GIF，自动载入完整的 _m/_r/_s 动画组合。左键选择角色后用 WASD 控制；其他角色按性格自动寻路；右键角色可睡觉或叫醒。',
+                'Playground scans every ZIP and GIF under resource/gif for complete _m/_r/_s animation sets. Left-click an actor to control it with WASD; all others pathfind automatically according to personality data.')),
+            (TXT('文件位置', 'Files'), TXT(
+                '个人偏好位于 local/preferences；游乐场主题配图位于 resource/pic；角色动画包与性格配置位于 resource/gif。',
+                'Preferences live in local/preferences; playground theme art lives in resource/pic; actor packs and personality configuration live in resource/gif.')),
+        ]
+        for heading, description in sections:
+            title = QLabel(heading)
+            title.setStyleSheet('font-size:19px; font-weight:700;')
+            body.addWidget(title)
+            paragraph = QLabel(description)
+            paragraph.setWordWrap(True)
+            paragraph.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            body.addWidget(paragraph)
+            body.addSpacing(9)
+        body.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        close = FloatingButton(TXT('关闭', 'Close'))
+        close.clicked.connect(guide.close)
+        outer.addWidget(close, 0, Qt.AlignRight)
+        self.guide_window = guide
+        guide.show()
 
     def _refresh_daily_song(self):
         if not hasattr(self, 'home_daily_title'):
@@ -2496,7 +3725,7 @@ class MusicPage(QWidget):
         self.source_combo.currentIndexChanged.connect(self._switch_source)
         online_row.addWidget(self.source_combo)
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText(TXT("搜索歌曲或专辑…", "Search tracks or albums…"))
+        self.search_box.setPlaceholderText(TXT("搜索歌曲、干员 EP 或活动 OST…", "Search tracks, operator EPs or event OSTs…"))
         self.search_box.textChanged.connect(self._search_changed)
         online_row.addWidget(self.search_box, 1)
         ll.addLayout(online_row)
@@ -2790,19 +4019,19 @@ class MusicPage(QWidget):
         self.open_folder_btn = FloatingButton(TXT("打开音乐文件夹", "Open Music Folder"))
         self.open_folder_btn.setObjectName("chipButton")
         self.open_folder_btn.clicked.connect(self._open_music_folder)
-        grid.addWidget(self.open_folder_btn, 3, 0, 1, 2)
+        grid.addWidget(self.open_folder_btn, 6, 0, 1, 2)
 
         self.open_preference_btn = FloatingButton(TXT("打开偏好设置文件夹", "Open Preferences Folder"))
         self.open_preference_btn.setObjectName("chipButton")
         self.open_preference_btn.clicked.connect(self._open_preference_folder)
-        grid.addWidget(self.open_preference_btn, 4, 0, 1, 2)
+        grid.addWidget(self.open_preference_btn, 7, 0, 1, 2)
 
         self.compress_check = VisibleCheckBox(TXT("后台转为 MP3 并压缩", "Convert to MP3 in background"))
         self.compress_check.setChecked(bool(self.settings_store.value("encode_mp3", True)))
         self.compress_check.toggled.connect(lambda checked: self.settings_store.setValue("encode_mp3", checked))
-        grid.addWidget(self.compress_check, 5, 0, 1, 2)
+        grid.addWidget(self.compress_check, 8, 0, 1, 2)
 
-        grid.addWidget(self._localized_label("MP3 比特率", "MP3 Bitrate"), 6, 0)
+        grid.addWidget(self._localized_label("MP3 比特率", "MP3 Bitrate"), 9, 0)
         self.bitrate_combo = VisibleComboBox()
         for bitrate in (128, 192, 256, 320):
             self.bitrate_combo.addItem(f"{bitrate} kbps", bitrate)
@@ -2810,9 +4039,9 @@ class MusicPage(QWidget):
         self.bitrate_combo.setCurrentIndex(max(0, bitrate_index))
         self.bitrate_combo.currentIndexChanged.connect(
             lambda _: self.settings_store.setValue("mp3_bitrate", self.bitrate_combo.currentData()))
-        grid.addWidget(self.bitrate_combo, 6, 1)
+        grid.addWidget(self.bitrate_combo, 9, 1)
 
-        grid.addWidget(self._localized_label("MP3 采样率", "MP3 Sample Rate"), 7, 0)
+        grid.addWidget(self._localized_label("MP3 采样率", "MP3 Sample Rate"), 10, 0)
         self.sample_combo = VisibleComboBox()
         for rate in (32000, 44100, 48000):
             self.sample_combo.addItem(f"{rate:,} Hz", rate)
@@ -2820,12 +4049,12 @@ class MusicPage(QWidget):
         self.sample_combo.setCurrentIndex(max(0, rate_index))
         self.sample_combo.currentIndexChanged.connect(
             lambda _: self.settings_store.setValue("mp3_sample_rate", self.sample_combo.currentData()))
-        grid.addWidget(self.sample_combo, 7, 1)
+        grid.addWidget(self.sample_combo, 10, 1)
 
         self.clear_cache_btn = FloatingButton(TXT("一键清理临时歌曲缓存", "Clear Temporary Song Cache"))
         self.clear_cache_btn.setObjectName("chipButton")
         self.clear_cache_btn.clicked.connect(self._clear_online_audio_cache)
-        grid.addWidget(self.clear_cache_btn, 8, 0, 1, 2)
+        grid.addWidget(self.clear_cache_btn, 11, 0, 1, 2)
 
         note = self._localized_label(
             "歌曲和个人偏好保存在项目下的 local 文件夹中。",
@@ -2833,25 +4062,10 @@ class MusicPage(QWidget):
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#787878; font-size:12px;")
-        grid.addWidget(note, 9, 0, 1, 2)
-        grid.setRowStretch(10, 1)
+        grid.addWidget(note, 12, 0, 1, 2)
+        grid.setRowStretch(13, 1)
         system.setWidget(host)
         return system
-
-    def _clear_online_audio_cache(self):
-        if self._saving_count:
-            return
-        self._selection_token += 1
-        self._purge_token = self._selection_token
-        self._pending_save = False
-        current_file = self.player.source().toLocalFile()
-        if current_file and Path(current_file).is_relative_to(CACHE_DIR / "siren" / "audio"):
-            self.player.stop()
-            self.player.setSource(QUrl())
-        target = CACHE_DIR / "siren" / "audio"
-        shutil.rmtree(target, ignore_errors=True)
-        target.mkdir(parents=True, exist_ok=True)
-        self.scan_status.setText(TXT("临时歌曲缓存已清理", "Temporary song cache cleared"))
 
     def _build_lyric_settings_view(self):
 
@@ -2967,26 +4181,20 @@ class MusicPage(QWidget):
         custom.setWidget(host)
         return custom
 
-    def _placeholder_cover(self):
-        pix = QPixmap(160, 160)
-        pix.fill(QColor("#e8ecf2" if ACTIVE_THEME == "day" else "#151515"))
-        p = QPainter(pix)
-        p.setPen(QColor("#708099" if ACTIVE_THEME == "day" else "#555555"))
-        f = QFont()
-        f.setPointSize(28)
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(pix.rect(), Qt.AlignCenter, "♪")
-        p.end()
-        return pix
-
-    def _pixmap_for_track(self, track, size=160):
-        data = track.get("cover_bytes")
-        if data:
-            pix = QPixmap()
-            if pix.loadFromData(data):
-                return pix.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
-        return self._placeholder_cover().scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    def _clear_online_audio_cache(self):
+        if self._saving_count:
+            return
+        self._selection_token += 1
+        self._purge_token = self._selection_token
+        self._pending_save = False
+        current_file = self.player.source().toLocalFile()
+        if current_file and Path(current_file).is_relative_to(CACHE_DIR / "siren" / "audio"):
+            self.player.stop()
+            self.player.setSource(QUrl())
+        target = CACHE_DIR / "siren" / "audio"
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        self.scan_status.setText(TXT("临时歌曲缓存已清理", "Temporary song cache cleared"))
 
     def _clear_music_cache(self):
         """Completely remove the disposable extraction cache before a rescan."""
@@ -3237,6 +4445,32 @@ class MusicPage(QWidget):
         self.online_limit = 90
         self._rebuild_playlist()
 
+    def _track_matches_query(self, track, query):
+        basic = ' '.join(str(track.get(key, '')) for key in ('title', 'artist', 'album'))
+        if query in basic.casefold():
+            return True
+        if not track.get('online'):
+            return False
+        normalize = lambda text: re.sub(r'[^\w]+', '', str(text), flags=re.UNICODE).casefold()
+        record = self.music_search_index.get(normalize(track.get('title', '')), {})
+        album_record = self.music_search_index.get(normalize(track.get('album', '')), {})
+        credits = self.prts_cache.get(track.get('cid'), {})
+        character = str(record.get('character') or album_record.get('character') or
+                        credits.get('character') or '')
+        event = str(record.get('event') or album_record.get('event') or
+                    credits.get('event') or '')
+        kind = str(credits.get('kind') or track.get('kind') or '').lower()
+        is_ost = kind == 'ost' or bool(re.search(r'(?:OST|原声带|Original Soundtrack)\s*$',
+                                                  track.get('album', ''), re.I))
+        term = normalize(query)
+        if not term:
+            return False
+        if character and not is_ost and kind not in ('op', 'ed') and term in normalize(character):
+            return True
+        if event and (is_ost or not character) and term in normalize(event):
+            return True
+        return False
+
     def _rebuild_playlist(self):
         scroll_y = self.playlist_scroll.verticalScrollBar().value() if hasattr(self, "playlist_scroll") else 0
         if hasattr(self, "playlist_scroll"):
@@ -3255,8 +4489,7 @@ class MusicPage(QWidget):
         ]
         query = self.search_box.text().strip().casefold() if hasattr(self, "search_box") else ""
         if query:
-            visible = [(i, track) for i, track in visible if query in
-                       (track["title"] + " " + track["artist"] + " " + track["album"]).casefold()]
+            visible = [(i, track) for i, track in visible if self._track_matches_query(track, query)]
         remaining = 0
 
         # Gather visible tracks by normalized album metadata.
@@ -3422,6 +4655,27 @@ class MusicPage(QWidget):
         self._more_scheduled = False
         self.online_limit += 55
         self._rebuild_playlist()
+
+    def _placeholder_cover(self):
+        pix = QPixmap(160, 160)
+        pix.fill(QColor("#e8ecf2" if ACTIVE_THEME == "day" else "#151515"))
+        p = QPainter(pix)
+        p.setPen(QColor("#708099" if ACTIVE_THEME == "day" else "#555555"))
+        f = QFont()
+        f.setPointSize(28)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "♪")
+        p.end()
+        return pix
+
+    def _pixmap_for_track(self, track, size=160):
+        data = track.get("cover_bytes")
+        if data:
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                return pix.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        return self._placeholder_cover().scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
 
     def _ensure_cover(self, track):
         if not track.get("online") or track.get("cover_bytes") or not track.get("cover_url"):
@@ -3736,9 +4990,20 @@ class MusicPage(QWidget):
         self.settings_store.setValue("desktop_lyrics_position", None)
 
     def _toggle_settings(self, enabled):
-        self.main_stack.setCurrentIndex(1 if enabled else 0)
+        # Return to the page the user came from instead of always jumping to the
+        # player. This keeps Home and Playground navigation consistent.
+        if enabled:
+            current = self.main_stack.currentIndex()
+            if current != 1:
+                self._page_before_settings = current
+            self.main_stack.setCurrentIndex(1)
+        else:
+            target = getattr(self, '_page_before_settings', 2)
+            if target == 1 or target < 0 or target >= self.main_stack.count():
+                target = 2
+            self.main_stack.setCurrentIndex(target)
         self.settings_btn.setText(
-            TXT("返回播放器", "Back to Player") if enabled else TXT("音乐设置", "Music Settings")
+            TXT("返回", "Back") if enabled else TXT("音乐设置", "Music Settings")
         )
 
     def _open_music_folder(self):

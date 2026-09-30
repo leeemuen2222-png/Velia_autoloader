@@ -1,10 +1,12 @@
 @echo off
 setlocal
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONUNBUFFERED=1"
 cd /d "%~dp0"
 
 if not exist "music_module.py" (
     echo music_module.py was not found next to this launcher.
-    echo Rename music_module^&5.py to music_module.py and try again.
     pause
     exit /b 1
 )
@@ -22,10 +24,10 @@ if not errorlevel 1 (
     set "VELIA_PYTHON=python"
 )
 
-%VELIA_PYTHON% -c "import PySide6, mutagen, imageio_ffmpeg" >nul 2>&1
+%VELIA_PYTHON% -c "import PySide6, mutagen" >nul 2>&1
 if errorlevel 1 (
     echo Installing player dependencies...
-    %VELIA_PYTHON% -m pip install PySide6 mutagen imageio-ffmpeg
+    %VELIA_PYTHON% -m pip install PySide6 mutagen
     if errorlevel 1 (
         echo Could not install player dependencies.
         pause
@@ -45,4 +47,5 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
 endlocal

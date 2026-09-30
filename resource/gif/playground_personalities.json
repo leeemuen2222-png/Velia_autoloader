@@ -1,0 +1,324 @@
+{
+  "version": 4,
+  "defaults": {
+    "relationship_weight": 1.0,
+    "relationship_label": "友好同事/外人"
+  },
+  "relationship_tiers": {
+    "外人": 1.0,
+    "友好同事": 1.0,
+    "熟人": 1.18,
+    "长期熟人": 1.35,
+    "朋友": 1.5,
+    "亲近朋友": 1.72,
+    "亲近学姐/学妹": 1.75,
+    "挚友": 2.05,
+    "姐妹": 2.2,
+    "极高亲密": 2.35
+  },
+  "notes": {
+    "zh": "关系权重影响社交目标选择，但社交只是移动行为之一。完成社交后，同一对角色会进入较长的重复社交冷却，并先进行一段普通移动。社交动画每个角色独立判定：80%使用r，20%使用_in。",
+    "en": "Relationship weight influences social target selection, but socializing is only one possible activity. After an encounter, the same pair has a long repeat cooldown and resumes ordinary movement first. Each participant independently uses r 80% and _in 20% during an interaction."
+  },
+  "profiles": {
+    "lemuen_social_observer": {
+      "behavior": "patrol",
+      "behavior_mix": {
+        "patrol": 0.48,
+        "drifter": 0.27,
+        "wander": 0.15,
+        "local_wander": 0.1
+      },
+      "speed": [
+        0.044,
+        0.062
+      ],
+      "turn_interval": [
+        5.8,
+        10.5
+      ],
+      "rest_chance": 0.17,
+      "rest_duration": [
+        1.5,
+        3.1
+      ],
+      "observe_chance": 0.3,
+      "observe_duration": [
+        1.8,
+        3.6
+      ],
+      "observe_radius": 0.34,
+      "social_goal_chance": 0.17,
+      "relationship_goal_gain": 0.55,
+      "max_social_goal_chance": 0.38,
+      "preferred_social_distance": 0.17,
+      "social_jitter": 0.045,
+      "interaction_chance": 0.58,
+      "interaction_distance": 0.092,
+      "social_duration": [
+        1.7,
+        3.0
+      ],
+      "social_cooldown": [
+        7.0,
+        11.0
+      ],
+      "repeat_partner_cooldown": [
+        18.0,
+        30.0
+      ],
+      "post_social_roam": [
+        8.0,
+        14.0
+      ],
+      "crowd_avoidance": 0.04,
+      "crowd_radius": 0.27,
+      "depth_bias": 0.56,
+      "depth_variance": 0.22,
+      "burst_after_pause_chance": 0.08,
+      "burst_after_social_chance": 0.05,
+      "burst_multiplier": 1.25,
+      "burst_duration": [
+        0.8,
+        1.3
+      ]
+    },
+    "skadi_solitary_roamer": {
+      "behavior": "drifter",
+      "behavior_mix": {
+        "drifter": 0.74,
+        "patrol": 0.15,
+        "perimeter": 0.08,
+        "local_wander": 0.03
+      },
+      "speed": [
+        0.032,
+        0.05
+      ],
+      "turn_interval": [
+        9.0,
+        15.5
+      ],
+      "rest_chance": 0.1,
+      "rest_duration": [
+        1.8,
+        3.6
+      ],
+      "observe_chance": 0.04,
+      "observe_duration": [
+        1.3,
+        2.2
+      ],
+      "observe_radius": 0.22,
+      "social_goal_chance": 0.025,
+      "relationship_goal_gain": 0.72,
+      "max_social_goal_chance": 0.2,
+      "preferred_social_distance": 0.24,
+      "social_jitter": 0.035,
+      "interaction_chance": 0.3,
+      "interaction_distance": 0.09,
+      "social_duration": [
+        1.2,
+        2.1
+      ],
+      "social_cooldown": [
+        10.0,
+        16.0
+      ],
+      "repeat_partner_cooldown": [
+        28.0,
+        45.0
+      ],
+      "post_social_roam": [
+        12.0,
+        20.0
+      ],
+      "crowd_avoidance": 0.82,
+      "crowd_radius": 0.31,
+      "avoidance_distance": 0.34,
+      "depth_bias": 0.62,
+      "depth_variance": 0.17,
+      "burst_after_pause_chance": 0.03,
+      "burst_after_social_chance": 0.01,
+      "burst_multiplier": 1.18,
+      "burst_duration": [
+        0.7,
+        1.1
+      ]
+    },
+    "spuria_active_social_wanderer": {
+      "behavior": "wander",
+      "behavior_mix": {
+        "wander": 0.43,
+        "local_wander": 0.34,
+        "patrol": 0.13,
+        "drifter": 0.06,
+        "perimeter": 0.04
+      },
+      "speed": [
+        0.075,
+        0.135
+      ],
+      "turn_interval": [
+        1.15,
+        3.2
+      ],
+      "rest_chance": 0.22,
+      "rest_duration": [
+        0.7,
+        1.9
+      ],
+      "observe_chance": 0.1,
+      "observe_duration": [
+        0.7,
+        1.5
+      ],
+      "observe_radius": 0.28,
+      "social_goal_chance": 0.2,
+      "relationship_goal_gain": 0.68,
+      "max_social_goal_chance": 0.44,
+      "preferred_social_distance": 0.15,
+      "social_jitter": 0.06,
+      "interaction_chance": 0.72,
+      "interaction_distance": 0.1,
+      "social_duration": [
+        1.0,
+        1.9
+      ],
+      "social_cooldown": [
+        5.0,
+        8.0
+      ],
+      "repeat_partner_cooldown": [
+        14.0,
+        24.0
+      ],
+      "post_social_roam": [
+        5.0,
+        10.0
+      ],
+      "crowd_avoidance": 0.08,
+      "crowd_radius": 0.25,
+      "depth_bias": 0.55,
+      "depth_variance": 0.35,
+      "burst_after_pause_chance": 0.62,
+      "burst_after_social_chance": 0.48,
+      "burst_multiplier": 1.85,
+      "burst_duration": [
+        1.2,
+        2.4
+      ]
+    },
+    "quick_wanderer": {
+      "behavior": "wander",
+      "behavior_mix": {
+        "wander": 0.55,
+        "local_wander": 0.35,
+        "patrol": 0.1
+      },
+      "speed": [
+        0.12,
+        0.19
+      ],
+      "turn_interval": [
+        1.0,
+        2.8
+      ],
+      "rest_chance": 0.08,
+      "rest_duration": [
+        0.6,
+        1.5
+      ],
+      "social_goal_chance": 0.1,
+      "relationship_goal_gain": 0.45,
+      "interaction_chance": 0.45,
+      "repeat_partner_cooldown": [
+        14.0,
+        24.0
+      ],
+      "post_social_roam": [
+        6.0,
+        10.0
+      ],
+      "crowd_avoidance": 0.12,
+      "depth_bias": 0.58,
+      "depth_variance": 0.33
+    },
+    "perimeter_walker": {
+      "behavior": "perimeter",
+      "behavior_mix": {
+        "perimeter": 0.75,
+        "patrol": 0.15,
+        "local_wander": 0.1
+      },
+      "speed": [
+        0.075,
+        0.115
+      ],
+      "turn_interval": [
+        3.2,
+        6.2
+      ],
+      "rest_chance": 0.1,
+      "rest_duration": [
+        1.0,
+        2.5
+      ],
+      "social_goal_chance": 0.06,
+      "relationship_goal_gain": 0.4,
+      "interaction_chance": 0.35,
+      "repeat_partner_cooldown": [
+        18.0,
+        28.0
+      ],
+      "post_social_roam": [
+        7.0,
+        12.0
+      ],
+      "crowd_avoidance": 0.18,
+      "depth_bias": 0.56,
+      "depth_variance": 0.32
+    }
+  },
+  "characters": {
+    "lmun": {
+      "display_name": "蕾缪安",
+      "aliases": [
+        "lemuen",
+        "蕾缪安"
+      ],
+      "profile": "lemuen_social_observer",
+      "speed_multiplier": 1.0
+    },
+    "ishar-mla": {
+      "display_name": "斯卡蒂",
+      "aliases": [
+        "skadi",
+        "斯卡蒂",
+        "浊心斯卡蒂"
+      ],
+      "profile": "skadi_solitary_roamer",
+      "speed_multiplier": 1.0
+    },
+    "spuria": {
+      "display_name": "空构",
+      "aliases": [
+        "空构"
+      ],
+      "profile": "spuria_active_social_wanderer",
+      "speed_multiplier": 1.0
+    }
+  },
+  "relationships": {
+    "spuria": {
+      "lmun": {
+        "label": "高亲密度/亲近学姐与长期熟人",
+        "weight": 1.85
+      },
+      "ishar-mla": {
+        "label": "友好同事",
+        "weight": 1.0
+      }
+    }
+  }
+}

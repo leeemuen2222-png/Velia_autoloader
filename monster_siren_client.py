@@ -206,6 +206,26 @@ def _related_music(title):
     return {}
 
 
+def music_search_index():
+    """Compact, exact-title PRTS character/event index for catalogue search."""
+    index = {}
+    normalize = lambda text: re.sub(r'[^\w]+', '', text, flags=re.UNICODE).casefold()
+    for row in _related_music_rows():
+        if len(row) < 4 or not row[0].strip():
+            continue
+        key = normalize(row[0])
+        if not key:
+            continue
+        entry = index.setdefault(key, {'character': '', 'event': ''})
+        for field, column in (('character', 2), ('event', 3)):
+            value = row[column].strip()
+            if value and value not in ('-', '—'):
+                existing = entry[field].split('、') if entry[field] else []
+                if value not in existing:
+                    entry[field] = '、'.join(existing + [value])
+    return index
+
+
 def _wiki_gg_article(title):
     """Exact wiki.gg title only; do not attach a similar track's credits."""
     query = urllib.parse.urlencode({'action': 'query', 'titles': title,
