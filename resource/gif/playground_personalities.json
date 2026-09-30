@@ -1,5 +1,5 @@
 {
-  "version": 9,
+  "version": 10,
   "defaults": {
     "relationship_weight": 1.0,
     "relationship_label": "友好同事/外人"
@@ -97,7 +97,12 @@
       "conversation_turns": [
         4,
         7
-      ]
+      ],
+      "low_affection_response": "withdraw",
+      "low_affection_social_multiplier": 0.52,
+      "low_affection_avoidance": 0.24,
+      "low_affection_avoid_radius": 0.28,
+      "low_affection_avoid_distance": 0.24
     },
     "skadi_solitary_roamer": {
       "behavior": "drifter",
@@ -176,7 +181,12 @@
       "conversation_turns": [
         3,
         5
-      ]
+      ],
+      "low_affection_response": "avoid",
+      "low_affection_social_multiplier": 0.28,
+      "low_affection_avoidance": 0.78,
+      "low_affection_avoid_radius": 0.34,
+      "low_affection_avoid_distance": 0.36
     },
     "spuria_active_social_wanderer": {
       "behavior": "wander",
@@ -255,7 +265,12 @@
       "conversation_turns": [
         6,
         10
-      ]
+      ],
+      "low_affection_response": "persistent",
+      "low_affection_social_multiplier": 0.72,
+      "low_affection_avoidance": 0.08,
+      "low_affection_avoid_radius": 0.25,
+      "low_affection_avoid_distance": 0.2
     },
     "quick_wanderer": {
       "behavior": "wander",
@@ -306,7 +321,10 @@
       "conversation_turns": [
         4,
         7
-      ]
+      ],
+      "low_affection_response": "withdraw",
+      "low_affection_social_multiplier": 0.45,
+      "low_affection_avoidance": 0.3
     },
     "perimeter_walker": {
       "behavior": "perimeter",
@@ -357,7 +375,10 @@
       "conversation_turns": [
         4,
         6
-      ]
+      ],
+      "low_affection_response": "withdraw",
+      "low_affection_social_multiplier": 0.42,
+      "low_affection_avoidance": 0.34
     },
     "gladiia_disciplined_hunter": {
       "behavior": "drifter",
@@ -437,7 +458,12 @@
       "conversation_turns": [
         3,
         5
-      ]
+      ],
+      "low_affection_response": "avoid",
+      "low_affection_social_multiplier": 0.36,
+      "low_affection_avoidance": 0.66,
+      "low_affection_avoid_radius": 0.34,
+      "low_affection_avoid_distance": 0.34
     },
     "specter_fervent_chaotic_hunter": {
       "behavior": "wander",
@@ -517,7 +543,12 @@
       "conversation_turns": [
         4,
         8
-      ]
+      ],
+      "low_affection_response": "volatile",
+      "low_affection_social_multiplier": 0.48,
+      "low_affection_avoidance": 0.42,
+      "low_affection_avoid_radius": 0.3,
+      "low_affection_avoid_distance": 0.28
     },
     "ulpianus_stern_guardian": {
       "behavior": "drifter",
@@ -597,7 +628,12 @@
       "conversation_turns": [
         3,
         5
-      ]
+      ],
+      "low_affection_response": "avoid",
+      "low_affection_social_multiplier": 0.32,
+      "low_affection_avoidance": 0.7,
+      "low_affection_avoid_radius": 0.35,
+      "low_affection_avoid_distance": 0.35
     }
   },
   "characters": {

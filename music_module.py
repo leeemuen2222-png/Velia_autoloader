@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
     QSizePolicy, QSlider, QSpinBox, QStackedWidget, QStyle, QStyleOptionButton,
-    QToolTip, QVBoxLayout,
+    QTextEdit, QToolTip, QVBoxLayout,
     QWidget,
 )
 
@@ -54,6 +54,7 @@ RESOURCE_PIC_DIR = RESOURCE_DIR / "pic"
 RESOURCE_GIF_DIR = RESOURCE_DIR / "gif"
 SETTINGS_FILE = PREFERENCE_DIR / "settings.json"
 LIBRARY_STATE_FILE = PREFERENCE_DIR / "library_state.json"
+PLAYGROUND_AFFECTION_FILE = PREFERENCE_DIR / "playground_affection.json"
 APP_SETTINGS = {"language": "zh"}
 ACTIVE_THEME = "night"
 
@@ -1311,6 +1312,7 @@ class HomeLibraryBanner(HoverHomePanel):
 
 
 class PlaygroundCanvas(QWidget):
+    themeTransitionFinished = Signal(str)
     """Multi-operator pseudo-3D playground.
 
     Each complete r/m/s GIF set becomes one actor. The selected actor is driven
@@ -1328,6 +1330,48 @@ class PlaygroundCanvas(QWidget):
         self._asset_error = ''
         self._conversations = []
         self._next_conversation_id = 1
+        self._manual_speeches = {}
+        self._speech_actor_id = None
+        self._social_history = []
+        self._history_sequence = 0
+        self._history_dialog = None
+
+        # Dynamic pairwise affection is independent of the static relationship graph.
+        # Every previously unseen pair starts at 50%.
+        self._affection = self._load_affection_state()
+
+        # Day/night playground transition. 1.0 = daylight, 0.0 = night.
+        self._daylight_mix = 1.0 if ACTIVE_THEME == 'day' else 0.0
+        self._daylight_start = self._daylight_mix
+        self._daylight_target = self._daylight_mix
+        self._daylight_elapsed = 0.0
+        self._daylight_duration = 1.85
+        self._daylight_running = False
+        self._daylight_target_theme = ACTIVE_THEME
+
+        self._speech_editor = QTextEdit(self)
+        self._speech_editor.setAcceptRichText(False)
+        self._speech_editor.setPlaceholderText(
+            TXT('输入内容…  再按 Enter 发送 · Shift+Enter 换行',
+                'Type…  press Enter again to send · Shift+Enter newline')
+        )
+        self._speech_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._speech_editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._speech_editor.setLineWrapMode(QTextEdit.WidgetWidth)
+        self._speech_editor.setStyleSheet(
+            'QTextEdit {'
+            ' background: rgba(232,235,240,218);'
+            ' color: #252a33;'
+            ' border: 1px solid rgba(150,158,170,220);'
+            ' border-radius: 11px;'
+            ' padding: 8px 10px;'
+            ' selection-background-color: rgba(115,135,165,110);'
+            '}'
+        )
+        self._speech_editor.hide()
+        self._speech_editor.installEventFilter(self)
+        self._speech_editor.textChanged.connect(self._resize_speech_editor)
+
         self._personality_data = self._load_personalities()
         self._discover_and_load_actors()
 
@@ -1335,6 +1379,370 @@ class PlaygroundCanvas(QWidget):
         self._clock.setInterval(16)
         self._clock.timeout.connect(self._tick)
         self._clock.start()
+
+    @staticmethod
+    def _mix_color(a, b, t):
+        t = max(0.0, min(1.0, float(t)))
+        return QColor(
+            round(a.red() + (b.red() - a.red()) * t),
+            round(a.green() + (b.green() - a.green()) * t),
+            round(a.blue() + (b.blue() - a.blue()) * t),
+            round(a.alpha() + (b.alpha() - a.alpha()) * t),
+        )
+
+    def _sleep_all_actors(self):
+        self._keys.clear()
+        self._selected = -1
+        if self._speech_editor.isVisible():
+            self._close_speech_editor(submit=False)
+        for conversation in list(self._conversations):
+            self._end_conversation(conversation)
+        for actor in self._actors:
+            actor['sleeping'] = True
+            actor['target_actor_id'] = None
+            actor['interaction_partner'] = None
+            actor['conversation_id'] = None
+            actor['rest_timer'] = 0.0
+            actor['ai_timer'] = 0.0
+            self._set_actor_mode(actor, 'sleep')
+
+    def _wake_all_actors(self):
+        self._keys.clear()
+        self._selected = -1
+        for actor in self._actors:
+            actor['sleeping'] = False
+            actor['interaction_partner'] = None
+            actor['conversation_id'] = None
+            actor['interaction_mode'] = None
+            self._set_actor_mode(actor, 'relax')
+            self._choose_ai_target(actor, force=True)
+
+    def begin_daylight_transition(self, target_theme):
+        target_theme = str(target_theme).lower()
+        if target_theme not in ('day', 'night'):
+            return
+
+        # Actor state changes immediately; the room lighting then changes slowly.
+        if target_theme == 'night':
+            self._sleep_all_actors()
+        else:
+            self._wake_all_actors()
+
+        desired = 1.0 if target_theme == 'day' else 0.0
+        self._daylight_start = float(self._daylight_mix)
+        self._daylight_target = desired
+        self._daylight_elapsed = 0.0
+        self._daylight_target_theme = target_theme
+
+        # If the visual state already matches, skip the redundant animation/theme switch.
+        if abs(self._daylight_start - desired) < 0.001 and ACTIVE_THEME == target_theme:
+            self._daylight_running = False
+            self.update()
+            return
+
+        self._daylight_running = True
+        self.update()
+
+    def sync_daylight_to_theme(self):
+        if self._daylight_running:
+            return
+        self._daylight_mix = 1.0 if ACTIVE_THEME == 'day' else 0.0
+        self._daylight_start = self._daylight_mix
+        self._daylight_target = self._daylight_mix
+        self.update()
+
+    def _tick_daylight_transition(self, dt):
+        if not self._daylight_running:
+            return
+        self._daylight_elapsed += dt
+        progress = min(1.0, self._daylight_elapsed / max(0.1, self._daylight_duration))
+        # Smoothstep gives a slow, cinematic start/end rather than a linear flash.
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        self._daylight_mix = (
+            self._daylight_start
+            + (self._daylight_target - self._daylight_start) * eased
+        )
+        if progress >= 1.0:
+            self._daylight_mix = self._daylight_target
+            self._daylight_running = False
+            self.themeTransitionFinished.emit(self._daylight_target_theme)
+
+    # ---------- dynamic affection ----------
+
+    @staticmethod
+    def _affection_pair_key(a, b):
+        left = str(a.get('id', a) if isinstance(a, dict) else a).casefold()
+        right = str(b.get('id', b) if isinstance(b, dict) else b).casefold()
+        return '::'.join(sorted((left, right)))
+
+    def _load_affection_state(self):
+        try:
+            loaded = json.loads(
+                PLAYGROUND_AFFECTION_FILE.read_text(encoding='utf-8')
+            )
+            if isinstance(loaded, dict):
+                pairs = loaded.get('pairs', loaded)
+                if isinstance(pairs, dict):
+                    clean = {}
+                    for key, value in pairs.items():
+                        try:
+                            clean[str(key)] = max(0.0, min(200.0, float(value)))
+                        except (TypeError, ValueError):
+                            pass
+                    return clean
+        except (OSError, ValueError, TypeError):
+            pass
+        return {}
+
+    def _save_affection_state(self):
+        try:
+            _write_json(
+                PLAYGROUND_AFFECTION_FILE,
+                {'version': 1, 'pairs': self._affection}
+            )
+        except OSError:
+            pass
+
+    def _affection_between(self, actor, other):
+        key = self._affection_pair_key(actor, other)
+        try:
+            return max(0.0, min(200.0, float(self._affection.get(key, 50.0))))
+        except (TypeError, ValueError):
+            return 50.0
+
+    def _affection_category(self, value):
+        value = max(0.0, min(200.0, float(value)))
+        if value < 10.0:
+            return TXT('恶劣', 'Hostile')
+        if value < 20.0:
+            return TXT('较差', 'Poor')
+        if value < 50.0:
+            return TXT('疏远', 'Distant')
+        if value < 90.0:
+            return TXT('普通', 'Neutral')
+        if value < 140.0:
+            return TXT('良好', 'Good')
+        return TXT('深厚', 'Deep')
+
+    def _change_affection(self, actor, other, delta):
+        key = self._affection_pair_key(actor, other)
+        before = self._affection_between(actor, other)
+        # Hard safety limits requested by the design.
+        delta = max(-1.65, min(2.0, float(delta)))
+        after = max(0.0, min(200.0, before + delta))
+        self._affection[key] = round(after, 4)
+        self._save_affection_state()
+        return before, after, delta
+
+    @staticmethod
+    def _conversation_type_table():
+        # 12 dialogue/social outcomes. The four neutral types intentionally
+        # change no affection, while positive/negative values remain capped.
+        return (
+            {
+                'id': 'deep_resonance',
+                'name_zh': '深度共鸣', 'name_en': 'Deep resonance',
+                'kind': 'positive', 'delta': (1.45, 2.00), 'base': 0.045,
+            },
+            {
+                'id': 'warm_support',
+                'name_zh': '温和支持', 'name_en': 'Warm support',
+                'kind': 'positive', 'delta': (1.00, 1.55), 'base': 0.060,
+            },
+            {
+                'id': 'shared_humor',
+                'name_zh': '轻松共鸣', 'name_en': 'Shared humor',
+                'kind': 'positive', 'delta': (0.60, 1.20), 'base': 0.075,
+            },
+            {
+                'id': 'pleasant_exchange',
+                'name_zh': '愉快交流', 'name_en': 'Pleasant exchange',
+                'kind': 'positive', 'delta': (0.20, 0.70), 'base': 0.090,
+            },
+            {
+                'id': 'ordinary_chat',
+                'name_zh': '普通闲谈', 'name_en': 'Ordinary chat',
+                'kind': 'neutral', 'delta': (0.0, 0.0), 'base': 0.165,
+            },
+            {
+                'id': 'practical_exchange',
+                'name_zh': '事务交流', 'name_en': 'Practical exchange',
+                'kind': 'neutral', 'delta': (0.0, 0.0), 'base': 0.155,
+            },
+            {
+                'id': 'quiet_company',
+                'name_zh': '安静陪伴', 'name_en': 'Quiet company',
+                'kind': 'neutral', 'delta': (0.0, 0.0), 'base': 0.145,
+            },
+            {
+                'id': 'awkward_pause',
+                'name_zh': '略显尴尬', 'name_en': 'Awkward pause',
+                'kind': 'neutral', 'delta': (0.0, 0.0), 'base': 0.125,
+            },
+            {
+                'id': 'mild_disagreement',
+                'name_zh': '轻微分歧', 'name_en': 'Mild disagreement',
+                'kind': 'negative', 'delta': (-0.50, -0.15), 'base': 0.060,
+            },
+            {
+                'id': 'sharp_disagreement',
+                'name_zh': '明显分歧', 'name_en': 'Sharp disagreement',
+                'kind': 'negative', 'delta': (-0.85, -0.45), 'base': 0.040,
+            },
+            {
+                'id': 'offense',
+                'name_zh': '产生冒犯', 'name_en': 'Offense',
+                'kind': 'negative', 'delta': (-1.20, -0.75), 'base': 0.025,
+            },
+            {
+                'id': 'serious_clash',
+                'name_zh': '严重冲突', 'name_en': 'Serious clash',
+                'kind': 'negative', 'delta': (-1.65, -1.10), 'base': 0.015,
+            },
+        )
+
+    def _choose_conversation_outcome(self, actor, other):
+        relation_weight = self._relationship(actor, other)['weight']
+        affection = self._affection_between(actor, other)
+
+        # Static relationship and dynamic affection influence probabilities
+        # independently. A neutral colleague relationship strongly favors
+        # no-change dialogue, while close relationships favor positive outcomes.
+        relation_positive = max(0.0, min(1.0, (relation_weight - 1.0) / 1.20))
+        relation_neutral = max(0.0, 1.0 - abs(relation_weight - 1.0) * 1.10)
+
+        affection_positive = max(0.0, min(1.0, (affection - 65.0) / 90.0))
+        affection_negative = max(0.0, min(1.0, (45.0 - affection) / 45.0))
+
+        weighted = []
+        total = 0.0
+        for entry in self._conversation_type_table():
+            weight = float(entry['base'])
+            kind = entry['kind']
+
+            if kind == 'positive':
+                weight *= (
+                    0.78
+                    + 2.15 * relation_positive
+                    + 0.80 * affection_positive
+                )
+                if relation_weight <= 1.05:
+                    weight *= 0.78
+            elif kind == 'neutral':
+                weight *= (
+                    1.0
+                    + 0.85 * relation_neutral
+                    - 0.25 * relation_positive
+                )
+                if 35.0 <= affection <= 80.0:
+                    weight *= 1.18
+            else:
+                weight *= (
+                    0.90
+                    + 1.55 * affection_negative
+                    - 0.52 * relation_positive
+                )
+                if relation_weight >= 1.65:
+                    weight *= 0.60
+
+            # Every evaluation includes a bounded random parameter.
+            weight *= random.uniform(0.84, 1.16)
+            weight = max(0.0001, weight)
+            weighted.append((entry, weight))
+            total += weight
+
+        pick = random.random() * total
+        chosen = weighted[-1][0]
+        for entry, weight in weighted:
+            pick -= weight
+            if pick <= 0:
+                chosen = entry
+                break
+
+        low, high = chosen['delta']
+        delta = random.uniform(float(low), float(high))
+        # Prevent tiny floating-point residue on neutral outcomes.
+        if abs(delta) < 1e-9:
+            delta = 0.0
+        before, after, applied = self._change_affection(actor, other, delta)
+        return {
+            'id': chosen['id'],
+            'name': TXT(chosen['name_zh'], chosen['name_en']),
+            'kind': chosen['kind'],
+            'delta': applied,
+            'before': before,
+            'after': after,
+            'category': self._affection_category(after),
+        }
+
+    def _low_affection_response(self, actor, other):
+        """Return (social multiplier, avoidance probability) by personality."""
+        affection = self._affection_between(actor, other)
+        if affection >= 20.0:
+            return 1.0, 0.0
+
+        profile = actor['profile']
+        mode = str(profile.get('low_affection_response', 'withdraw')).lower()
+        social_mult = float(
+            profile.get('low_affection_social_multiplier', 0.45) or 0.45
+        )
+        avoid = float(
+            profile.get('low_affection_avoidance', 0.35) or 0.35
+        )
+
+        # 0-10 is more severe than 10-20.
+        severity = 1.0 if affection < 10.0 else 0.68
+        if mode == 'persistent':
+            social_mult = max(social_mult, 0.68)
+            avoid *= 0.35
+        elif mode == 'avoid':
+            social_mult *= 0.72
+            avoid = max(avoid, 0.62)
+        elif mode == 'volatile':
+            social_mult *= random.uniform(0.55, 0.95)
+            avoid *= random.uniform(0.70, 1.25)
+
+        return max(0.05, min(1.0, social_mult)), max(
+            0.0, min(0.95, avoid * severity)
+        )
+
+    def _avoid_low_affection_actor(self, actor, others):
+        candidates = []
+        for other in others:
+            affection = self._affection_between(actor, other)
+            if affection >= 20.0:
+                continue
+            social_mult, avoid_probability = self._low_affection_response(
+                actor, other
+            )
+            if random.random() >= avoid_probability:
+                continue
+            distance = self._world_distance(actor, other)
+            radius = float(
+                actor['profile'].get('low_affection_avoid_radius', 0.31) or 0.31
+            )
+            if distance <= radius:
+                candidates.append((affection, distance, other))
+
+        if not candidates:
+            return None
+
+        # Prefer avoiding the lowest-affection nearby person.
+        _affection, _distance, other = min(
+            candidates, key=lambda item: (item[0], item[1])
+        )
+        vx = actor['x'] - other['x']
+        vd = actor['depth'] - other['depth']
+        mag = max(0.001, math.hypot(vx, vd))
+        push = float(
+            actor['profile'].get('low_affection_avoid_distance', 0.30) or 0.30
+        )
+        actor['target_actor_id'] = None
+        return (
+            max(0.10, min(0.90, actor['x'] + vx / mag * push)),
+            max(0.14, min(0.90, actor['depth'] + vd / mag * push)),
+            'affection_avoid',
+        )
 
     # ---------- asset discovery ----------
 
@@ -1696,7 +2104,17 @@ class PlaygroundCanvas(QWidget):
                 continue
             relation = self._relationship(actor, other)
             distance = max(0.04, self._world_distance(actor, other))
-            score = relation['weight'] / (0.18 + distance)
+            affection = self._affection_between(actor, other)
+            social_mult, _avoid_probability = self._low_affection_response(
+                actor, other
+            )
+            affinity_factor = max(0.38, min(1.55, 0.72 + affection / 120.0))
+            score = (
+                relation['weight']
+                * affinity_factor
+                * social_mult
+                / (0.18 + distance)
+            )
             candidates.append((other, relation, score))
             total += score
 
@@ -1719,6 +2137,12 @@ class PlaygroundCanvas(QWidget):
         others = self._other_actors(actor)
         if not others:
             return None
+
+        # Very low dynamic affection can suppress contact or cause active
+        # avoidance, but how strongly this happens depends on personality.
+        affection_avoid = self._avoid_low_affection_actor(actor, others)
+        if affection_avoid is not None:
+            return affection_avoid
 
         # Crowd avoidance is evaluated before attraction.
         crowd_radius = float(profile.get('crowd_radius', 0.28) or 0.28)
@@ -1748,6 +2172,10 @@ class PlaygroundCanvas(QWidget):
         base_goal = float(profile.get('social_goal_chance', 0.12) or 0.12)
         relation_gain = float(profile.get('relationship_goal_gain', 0.55) or 0.55)
         chance = base_goal * (1.0 + relation_gain * max(0.0, weight - 1.0))
+        social_mult, _avoid_probability = self._low_affection_response(actor, other)
+        affection = self._affection_between(actor, other)
+        affinity_factor = max(0.45, min(1.30, 0.72 + affection / 150.0))
+        chance *= social_mult * affinity_factor
         chance = min(float(profile.get('max_social_goal_chance', 0.48) or 0.48), chance)
         if random.random() >= chance:
             return None
@@ -1897,6 +2325,28 @@ class PlaygroundCanvas(QWidget):
         conversation['text'] = self._generate_gibberish(speaker)
         conversation['shown_text'] = ''
         conversation['char_progress'] = 0.0
+
+        # Gibberish placeholder dialogue is real dialogue for history purposes.
+        # Record the complete generated line immediately so an interrupted turn
+        # is still present in Social History.
+        target_ids = [
+            actor_id
+            for actor_id in conversation.get('participants', [])
+            if actor_id != speaker.get('id')
+        ]
+        affection_event = None
+        if not conversation.get('affection_event_logged'):
+            affection_event = conversation.get('affection_event')
+            conversation['affection_event_logged'] = True
+        self._record_social_history(
+            speaker,
+            conversation['text'],
+            target_ids=target_ids,
+            source='ai',
+            conversation_id=conversation.get('id'),
+            affection_event=affection_event,
+        )
+        conversation['history_recorded'] = True
         conversation['state'] = 'typing'
         conversation['pause_timer'] = 0.0
         conversation['typing_speed'] = max(
@@ -1912,6 +2362,7 @@ class PlaygroundCanvas(QWidget):
         conversation['join_check_timer'] = min(conversation.get('join_check_timer', 1.6), 1.6)
 
     def _start_conversation(self, actor, other, duration):
+        affection_event = self._choose_conversation_outcome(actor, other)
         conversation = {
             'id': self._next_conversation_id,
             'participants': [actor['id'], other['id']],
@@ -1926,6 +2377,8 @@ class PlaygroundCanvas(QWidget):
             'turn_index': 0,
             'max_turns': self._conversation_turn_limit([actor, other], duration),
             'join_check_timer': random.uniform(1.1, 2.1),
+            'affection_event': affection_event,
+            'affection_event_logged': False,
         }
         self._next_conversation_id += 1
         self._conversations.append(conversation)
@@ -2014,6 +2467,27 @@ class PlaygroundCanvas(QWidget):
                 actor['interaction_mode'] = 'relax'
                 if actor['id'] not in conversation['participants']:
                     conversation['participants'].append(actor['id'])
+
+                # Joining an existing conversation is also a social event.
+                # Apply exactly one outcome against the nearest current member.
+                existing = [member for member in members if member is not actor]
+                if existing:
+                    nearest_member = min(
+                        existing,
+                        key=lambda other: self._world_distance(actor, other)
+                    )
+                    join_event = self._choose_conversation_outcome(
+                        actor, nearest_member
+                    )
+                    self._record_social_history(
+                        actor,
+                        self._generate_gibberish(actor),
+                        target_ids=[nearest_member['id']],
+                        source='ai',
+                        conversation_id=conversation.get('id'),
+                        affection_event=join_event,
+                    )
+
                 actor['facing'] = 1 if center_x > actor['x'] else -1
                 return True
         return False
@@ -2043,6 +2517,25 @@ class PlaygroundCanvas(QWidget):
                 visible = min(len(text), int(conversation['char_progress']))
                 conversation['shown_text'] = text[:visible]
                 if visible >= len(text):
+                    if not conversation.get('history_recorded'):
+                        target_ids = [
+                            actor_id
+                            for actor_id in conversation.get('participants', [])
+                            if actor_id != speaker.get('id')
+                        ]
+                        affection_event = None
+                        if not conversation.get('affection_event_logged'):
+                            affection_event = conversation.get('affection_event')
+                            conversation['affection_event_logged'] = True
+                        self._record_social_history(
+                            speaker,
+                            text,
+                            target_ids=target_ids,
+                            source='ai',
+                            conversation_id=conversation.get('id'),
+                            affection_event=affection_event,
+                        )
+                        conversation['history_recorded'] = True
                     conversation['state'] = 'pause'
                     pause = self._range_value(
                         speaker['profile'].get('conversation_turn_pause'), 0.62)
@@ -2070,7 +2563,13 @@ class PlaygroundCanvas(QWidget):
 
         relation = self._relationship(actor, other)
         base = float(actor['profile'].get('interaction_chance', 0.55) or 0.55)
-        chance = min(0.90, base * max(0.65, min(1.45, relation['weight'])))
+        social_mult, _avoid_probability = self._low_affection_response(actor, other)
+        chance = min(
+            0.90,
+            base
+            * max(0.65, min(1.45, relation['weight']))
+            * social_mult
+        )
         if random.random() > chance:
             return False
 
@@ -2375,9 +2874,383 @@ class PlaygroundCanvas(QWidget):
             actor['depth'] = max(0.10, min(0.93, actor['depth']))
 
         self._tick_conversations(dt)
+        self._tick_manual_speeches(dt)
+        self._tick_daylight_transition(dt)
+        if self._speech_editor.isVisible():
+            self._position_speech_editor()
         self.update()
 
+    def _history_actor_name(self, actor_id):
+        actor = self._actor_by_id(actor_id)
+        return actor.get('display_name', actor_id) if actor is not None else str(actor_id)
+
+    def _record_social_history(self, speaker, text, target_ids=None,
+                               source='ai', conversation_id=None,
+                               affection_event=None):
+        text = str(text or '').strip()
+        if not text or speaker is None:
+            return
+
+        if isinstance(speaker, dict):
+            speaker_id = speaker.get('id', '')
+            speaker_name = speaker.get('display_name', speaker_id)
+        else:
+            speaker_id = str(speaker)
+            speaker_name = self._history_actor_name(speaker_id)
+
+        targets = []
+        for target_id in (target_ids or []):
+            if target_id and target_id != speaker_id:
+                targets.append({
+                    'id': target_id,
+                    'name': self._history_actor_name(target_id),
+                })
+
+        self._history_sequence += 1
+        self._social_history.append({
+            'sequence': self._history_sequence,
+            'speaker_id': speaker_id,
+            'speaker_name': speaker_name,
+            'targets': targets,
+            'text': text,
+            'source': source,
+            'conversation_id': conversation_id,
+            'affection_event': dict(affection_event or {}),
+        })
+
+        # Avoid unbounded growth during very long sessions.
+        if len(self._social_history) > 600:
+            self._social_history = self._social_history[-600:]
+
+    def _show_social_history(self):
+        if self._history_dialog is not None:
+            try:
+                self._history_dialog.close()
+            except RuntimeError:
+                pass
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(TXT('Social History · 社交记录',
+                                  'Social History'))
+        dialog.resize(720, 620)
+        dialog.setModal(False)
+        self._history_dialog = dialog
+
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(12)
+
+        header = QHBoxLayout()
+        title = QLabel(TXT('Social History', 'Social History'))
+        title.setStyleSheet('font-size:22px; font-weight:700;')
+        header.addWidget(title)
+        header.addStretch()
+
+        count = QLabel()
+        count.setStyleSheet('color:#7d8795;')
+        header.addWidget(count)
+        outer.addLayout(header)
+
+        controls = QHBoxLayout()
+        user_only = VisibleCheckBox(TXT('仅显示用户发言', 'User messages only'))
+        user_only.setChecked(False)
+        user_only.setStyleSheet(
+            'QCheckBox { spacing: 8px; padding: 2px 0; }'
+        )
+        controls.addWidget(user_only)
+        controls.addStretch()
+        outer.addLayout(controls)
+
+        sub = QLabel(TXT(
+            '按时间顺序记录干员之间的对话；玩家发送的信息会标记为「用户控制」。',
+            'Conversation history in chronological order; player messages are marked as user-controlled.'
+        ))
+        sub.setWordWrap(True)
+        sub.setStyleSheet('color:#8b939f;')
+        outer.addWidget(sub)
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget(scroll)
+        feed = QVBoxLayout(body)
+        feed.setContentsMargins(2, 4, 8, 4)
+        feed.setSpacing(10)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        def clear_feed():
+            while feed.count():
+                item = feed.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+                child_layout = item.layout()
+                if child_layout is not None:
+                    while child_layout.count():
+                        child_item = child_layout.takeAt(0)
+                        child_widget = child_item.widget()
+                        if child_widget is not None:
+                            child_widget.deleteLater()
+
+        def refresh_history():
+            clear_feed()
+            entries = self._social_history
+            if user_only.isChecked():
+                entries = [
+                    entry for entry in entries
+                    if entry.get('source') == 'user'
+                ]
+
+            if user_only.isChecked():
+                count.setText(TXT(
+                    f'{len(entries)} 条用户记录',
+                    f'{len(entries)} user messages'
+                ))
+            else:
+                count.setText(TXT(
+                    f'{len(entries)} 条记录',
+                    f'{len(entries)} messages'
+                ))
+
+            if not entries:
+                empty = QLabel(
+                    TXT(
+                        '没有用户发言记录。' if user_only.isChecked()
+                        else '还没有社交记录。',
+                        'No user messages yet.' if user_only.isChecked()
+                        else 'No social history yet.'
+                    )
+                )
+                empty.setAlignment(Qt.AlignCenter)
+                empty.setStyleSheet('color:#8b939f; padding:36px;')
+                feed.addWidget(empty)
+            else:
+                for entry in entries:
+                    card = QFrame(body)
+                    card.setObjectName('socialHistoryCard')
+                    card.setStyleSheet(
+                        'QFrame#socialHistoryCard {'
+                        ' background: rgba(128,136,148,22);'
+                        ' border: 1px solid rgba(128,136,148,48);'
+                        ' border-radius: 12px;'
+                        '}'
+                    )
+                    card_layout = QVBoxLayout(card)
+                    card_layout.setContentsMargins(13, 10, 13, 11)
+                    card_layout.setSpacing(5)
+
+                    targets = entry.get('targets') or []
+                    if entry.get('source') == 'user':
+                        relation_text = TXT(
+                            '用户控制 · 无固定社交目标',
+                            'User-controlled · no fixed social target'
+                        )
+                    elif targets:
+                        target_names = '、'.join(t['name'] for t in targets)
+                        relation_text = TXT(
+                            f'对 {target_names}',
+                            f'to {", ".join(t["name"] for t in targets)}'
+                        )
+                    else:
+                        relation_text = TXT(
+                            '无固定社交目标',
+                            'no fixed social target'
+                        )
+
+                    meta = QLabel(
+                        f"<b>{entry.get('speaker_name', '')}</b>"
+                        f"  <span style='color:#8b939f'>· {relation_text}</span>"
+                    )
+                    meta.setTextFormat(Qt.RichText)
+                    card_layout.addWidget(meta)
+
+                    affection_event = entry.get('affection_event') or {}
+                    if affection_event:
+                        delta = float(affection_event.get('delta', 0.0) or 0.0)
+                        after = float(affection_event.get('after', 50.0) or 50.0)
+                        category = affection_event.get('category', '')
+                        sign = '+' if delta > 0 else ''
+                        outcome = QLabel(TXT(
+                            f"对话类型：{affection_event.get('name', '')} · "
+                            f"好感 {sign}{delta:.2f}% · 当前 {after:.2f}%（{category}）",
+                            f"Dialogue: {affection_event.get('name', '')} · "
+                            f"Affection {sign}{delta:.2f}% · now {after:.2f}% ({category})"
+                        ))
+                        outcome.setStyleSheet(
+                            'color:#7d8795; font-size:12px; padding:0 0 2px 0;'
+                        )
+                        card_layout.addWidget(outcome)
+
+                    message = QLabel(entry.get('text', ''))
+                    message.setWordWrap(True)
+                    message.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                    message.setStyleSheet(
+                        'font-size:14px; padding:2px 0 1px 0;'
+                    )
+                    card_layout.addWidget(message)
+                    feed.addWidget(card)
+
+            feed.addStretch()
+
+        user_only.toggled.connect(refresh_history)
+        refresh_history()
+
+        close_btn = FloatingButton(TXT('关闭', 'Close'))
+        close_btn.clicked.connect(dialog.close)
+        outer.addWidget(close_btn, 0, Qt.AlignRight)
+
+        dialog.finished.connect(
+            lambda _result: setattr(self, '_history_dialog', None)
+            if self._history_dialog is dialog else None
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _selected_actor(self):
+        if 0 <= self._selected < len(self._actors):
+            return self._actors[self._selected]
+        return None
+
+    def _open_speech_editor(self):
+        actor = self._selected_actor()
+        if actor is None or actor.get('sleeping'):
+            return
+        self._keys.clear()
+        self._speech_actor_id = actor['id']
+        self._speech_editor.clear()
+        self._speech_editor.show()
+        self._resize_speech_editor()
+        self._position_speech_editor()
+        self._speech_editor.raise_()
+        self._speech_editor.setFocus(Qt.ShortcutFocusReason)
+
+    def _close_speech_editor(self, submit=False):
+        if not self._speech_editor.isVisible():
+            return
+        actor = self._actor_by_id(self._speech_actor_id)
+        content = self._speech_editor.toPlainText().strip()
+        if submit and actor is not None and content:
+            # Second Enter sends. Player speech remains above the operator
+            # for at least two visible seconds and has no fixed social target.
+            self._manual_speeches[actor['id']] = {
+                'text': content,
+                'created_at': time.monotonic(),
+                'expires_at': time.monotonic() + 2.35,
+            }
+            self._record_social_history(
+                actor,
+                content,
+                target_ids=[],
+                source='user',
+                conversation_id=None,
+            )
+        self._speech_editor.hide()
+        self._speech_editor.clear()
+        self._speech_actor_id = None
+        self.setFocus(Qt.ShortcutFocusReason)
+        self.update()
+
+    def _resize_speech_editor(self):
+        if not self._speech_editor.isVisible():
+            return
+
+        text_value = self._speech_editor.toPlainText()
+        fm = QFontMetrics(self._speech_editor.font())
+
+        # Grow horizontally until the maximum width, then wrap naturally.
+        longest = max(text_value.splitlines() or [''], key=len)
+        wanted_width = fm.horizontalAdvance(longest) + 46
+        width = max(190, min(390, wanted_width))
+
+        document = self._speech_editor.document()
+        document.setTextWidth(max(120, width - 28))
+        wanted_height = int(document.size().height()) + 28
+        height = max(48, min(230, wanted_height))
+
+        self._speech_editor.resize(width, height)
+        self._position_speech_editor()
+
+    def _position_speech_editor(self):
+        if not self._speech_editor.isVisible():
+            return
+        actor = self._actor_by_id(self._speech_actor_id)
+        if actor is None:
+            self._close_speech_editor(False)
+            return
+
+        rect = actor.get('rect') or QRectF()
+        if rect.isNull():
+            return
+
+        width = self._speech_editor.width()
+        height = self._speech_editor.height()
+        x = int(rect.center().x() - width / 2)
+        y = int(rect.top() - height - 18)
+
+        x = max(8, min(self.width() - width - 8, x))
+        y = max(8, min(self.height() - height - 8, y))
+        self._speech_editor.move(x, y)
+        self._speech_editor.raise_()
+
+    def _tick_manual_speeches(self, dt):
+        # Manual speech is deliberately independent from AI/social state.
+        # Ending a conversation, changing modes, or returning to AI must not
+        # remove a player-sent bubble before its own expiry time.
+        now = time.monotonic()
+        for actor_id in list(self._manual_speeches):
+            data = self._manual_speeches[actor_id]
+            expires_at = float(data.get('expires_at', now))
+            if now >= expires_at:
+                self._manual_speeches.pop(actor_id, None)
+
+    def eventFilter(self, watched, event):
+        if watched is self._speech_editor and event.type() == QEvent.KeyPress:
+            if (event.key() == Qt.Key_S
+                    and event.modifiers() & Qt.ControlModifier):
+                self._show_social_history()
+                event.accept()
+                return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ShiftModifier:
+                    return False
+                self._close_speech_editor(submit=True)
+                event.accept()
+                return True
+            if event.key() == Qt.Key_Escape:
+                self._close_speech_editor(submit=False)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
     def keyPressEvent(self, event):
+        if (event.key() == Qt.Key_S
+                and event.modifiers() & Qt.ControlModifier):
+            self._keys.clear()
+            self._show_social_history()
+            event.accept()
+            return
+
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            if self._selected_actor() is not None:
+                self._open_speech_editor()
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_R:
+            if self._speech_editor.isVisible():
+                self._close_speech_editor(submit=False)
+            # Release manual control: no actor remains selected.
+            self._selected = -1
+            self._keys.clear()
+            for actor in self._actors:
+                if not actor.get('sleeping') and not actor.get('conversation_id'):
+                    self._choose_ai_target(actor, force=True)
+            self.update()
+            event.accept()
+            return
+
         if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
             if 0 <= self._selected < len(self._actors) and not self._actors[self._selected]['sleeping']:
                 self._keys.add(event.key())
@@ -2405,6 +3278,8 @@ class PlaygroundCanvas(QWidget):
         hit = self._actor_at(event.position())
 
         if event.button() == Qt.LeftButton and hit >= 0:
+            if self._speech_editor.isVisible():
+                self._close_speech_editor(submit=False)
             self._selected = hit
             self._keys.clear()
             self.update()
@@ -2459,12 +3334,22 @@ class PlaygroundCanvas(QWidget):
         return room['back_bottom'] + (room['floor_bottom'] - room['back_bottom']) * (t ** 1.72)
 
     def _draw_grid(self, painter):
-        day = ACTIVE_THEME == 'day'
-        bg = QColor('#eef8ff' if day else '#06080b')
-        wall_fill = QColor('#e7f4fd' if day else '#090d12')
-        floor_fill = QColor('#edf8ff' if day else '#070a0e')
-        major = QColor(35, 145, 220, 125) if day else QColor(195, 210, 230, 82)
-        minor = QColor(60, 165, 225, 58) if day else QColor(145, 160, 180, 42)
+        # `_daylight_mix` is independent from ACTIVE_THEME while animating.
+        # 0 = full night, 1 = full daylight.
+        daylight = max(0.0, min(1.0, float(self._daylight_mix)))
+        bg = self._mix_color(QColor('#06080b'), QColor('#eef8ff'), daylight)
+        wall_fill = self._mix_color(QColor('#090d12'), QColor('#e7f4fd'), daylight)
+        floor_fill = self._mix_color(QColor('#070a0e'), QColor('#edf8ff'), daylight)
+        major = self._mix_color(
+            QColor(195, 210, 230, 82),
+            QColor(35, 145, 220, 125),
+            daylight,
+        )
+        minor = self._mix_color(
+            QColor(145, 160, 180, 42),
+            QColor(60, 165, 225, 58),
+            daylight,
+        )
 
         painter.fillRect(self.rect(), bg)
         room = self._room_geometry()
@@ -2641,6 +3526,17 @@ class PlaygroundCanvas(QWidget):
                 continue
             self._draw_conversation_bubble(painter, speaker, conversation)
 
+    def _draw_manual_speeches(self, painter):
+        for actor_id, speech in self._manual_speeches.items():
+            actor = self._actor_by_id(actor_id)
+            if actor is None:
+                continue
+            self._draw_conversation_bubble(
+                painter,
+                actor,
+                {'shown_text': speech.get('text', '')},
+            )
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -2677,10 +3573,13 @@ class PlaygroundCanvas(QWidget):
             painter.drawPixmap(dest, frame, source)
             painter.restore()
 
+        # AI dialogue and player speech are two independent overlay layers.
         self._draw_conversations(painter)
+        self._draw_manual_speeches(painter)
 
 class PlaygroundPage(QWidget):
     backRequested = Signal()
+    themeRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2694,10 +3593,24 @@ class PlaygroundPage(QWidget):
         title.setStyleSheet('font-size:24px; font-weight:700;')
         header.addWidget(title)
         header.addStretch()
-        hint = QLabel(TXT('左键选择角色 · WASD 移动 · 右键：睡觉/叫醒 · 角色会自动对话', 'Left-click to select · WASD move · Right-click: sleep/wake · actors can chat'))
+
+        self.night_btn = FloatingButton(TXT('天黑了', 'Night falls'))
+        self.day_btn = FloatingButton(TXT('天亮了', 'Day breaks'))
+        header.addWidget(self.night_btn)
+        header.addWidget(self.day_btn)
+
+        hint = QLabel(TXT('左键选择角色 · WASD 移动 · R 释放控制 · Enter 输入/发送 · Ctrl+S 社交记录 · 右键：睡觉/叫醒', 'Left-click to select · WASD move · R release control · Enter type/send · Ctrl+S social history · Right-click: sleep/wake'))
         header.addWidget(hint)
         outer.addLayout(header)
+
         self.canvas = PlaygroundCanvas(self)
+        self.canvas.themeTransitionFinished.connect(self.themeRequested)
+        self.night_btn.clicked.connect(
+            lambda: self.canvas.begin_daylight_transition('night')
+        )
+        self.day_btn.clicked.connect(
+            lambda: self.canvas.begin_daylight_transition('day')
+        )
         outer.addWidget(self.canvas, 1)
 
 class MusicPage(QWidget):
@@ -3252,6 +4165,8 @@ class MusicPage(QWidget):
         global ACTIVE_THEME
         ACTIVE_THEME = self._effective_theme()
         _STAR_CACHE.clear()
+        if hasattr(self, 'playground_page'):
+            QTimer.singleShot(0, self.playground_page.canvas.sync_daylight_to_theme)
         QApplication.instance().setStyleSheet(theme_css(STYLE))
         QTimer.singleShot(0, self._update_playground_art)
         self._rebuild_playlist()
@@ -3873,7 +4788,32 @@ class MusicPage(QWidget):
     def _build_playground_view(self):
         self.playground_page = PlaygroundPage(self)
         self.playground_page.backRequested.connect(lambda: self.main_stack.setCurrentIndex(2))
+        self.playground_page.themeRequested.connect(self._playground_theme_requested)
         return self.playground_page
+
+    def _playground_theme_requested(self, theme):
+        if theme not in ('day', 'night'):
+            return
+
+        # Skip a redundant theme application when already in the requested mode.
+        if self._effective_theme() == theme and self.theme_mode == theme:
+            if hasattr(self, 'playground_page'):
+                self.playground_page.canvas.sync_daylight_to_theme()
+            return
+
+        self.theme_mode = theme
+        self.settings_store.setValue('theme', theme)
+
+        if hasattr(self, 'theme_combo'):
+            index = self.theme_combo.findData(theme)
+            if index >= 0:
+                blocked = self.theme_combo.blockSignals(True)
+                self.theme_combo.setCurrentIndex(index)
+                self.theme_combo.blockSignals(blocked)
+
+        self._apply_theme()
+        if hasattr(self, 'playground_page'):
+            self.playground_page.canvas.sync_daylight_to_theme()
 
     def _show_guide(self):
         if getattr(self, 'guide_window', None) is not None and self.guide_window.isVisible():
