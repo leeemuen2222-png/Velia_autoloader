@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 8,
   "defaults": {
     "relationship_weight": 1.0,
     "relationship_label": "友好同事/外人"
@@ -81,6 +81,22 @@
       "burst_duration": [
         0.8,
         1.3
+      ],
+      "speech_style": "neutral",
+      "conversation_join_chance": 0.11,
+      "conversation_join_radius": 0.25,
+      "conversation_speakiness": 1.0,
+      "typing_speed": [
+        15,
+        19
+      ],
+      "conversation_turn_pause": [
+        0.42,
+        0.72
+      ],
+      "conversation_turns": [
+        4,
+        7
       ]
     },
     "skadi_solitary_roamer": {
@@ -144,6 +160,22 @@
       "burst_duration": [
         0.7,
         1.1
+      ],
+      "speech_style": "brief",
+      "conversation_join_chance": 0.03,
+      "conversation_join_radius": 0.21,
+      "conversation_speakiness": 0.72,
+      "typing_speed": [
+        11,
+        15
+      ],
+      "conversation_turn_pause": [
+        0.55,
+        0.92
+      ],
+      "conversation_turns": [
+        3,
+        5
       ]
     },
     "spuria_active_social_wanderer": {
@@ -207,6 +239,22 @@
       "burst_duration": [
         1.2,
         2.4
+      ],
+      "speech_style": "lively",
+      "conversation_join_chance": 0.24,
+      "conversation_join_radius": 0.28,
+      "conversation_speakiness": 1.34,
+      "typing_speed": [
+        17,
+        23
+      ],
+      "conversation_turn_pause": [
+        0.28,
+        0.56
+      ],
+      "conversation_turns": [
+        6,
+        10
       ]
     },
     "quick_wanderer": {
@@ -242,7 +290,23 @@
       ],
       "crowd_avoidance": 0.12,
       "depth_bias": 0.58,
-      "depth_variance": 0.33
+      "depth_variance": 0.33,
+      "speech_style": "neutral",
+      "conversation_join_chance": 0.08,
+      "conversation_join_radius": 0.24,
+      "conversation_speakiness": 1.0,
+      "typing_speed": [
+        14,
+        18
+      ],
+      "conversation_turn_pause": [
+        0.4,
+        0.7
+      ],
+      "conversation_turns": [
+        4,
+        7
+      ]
     },
     "perimeter_walker": {
       "behavior": "perimeter",
@@ -277,7 +341,183 @@
       ],
       "crowd_avoidance": 0.18,
       "depth_bias": 0.56,
-      "depth_variance": 0.32
+      "depth_variance": 0.32,
+      "speech_style": "brief",
+      "conversation_join_chance": 0.05,
+      "conversation_join_radius": 0.22,
+      "conversation_speakiness": 0.85,
+      "typing_speed": [
+        12,
+        16
+      ],
+      "conversation_turn_pause": [
+        0.42,
+        0.82
+      ],
+      "conversation_turns": [
+        4,
+        6
+      ]
+    },
+    "gladiia_disciplined_hunter": {
+      "behavior": "drifter",
+      "behavior_mix": {
+        "drifter": 0.48,
+        "patrol": 0.28,
+        "perimeter": 0.14,
+        "local_wander": 0.04,
+        "wander": 0.06
+      },
+      "speed": [
+        0.105,
+        0.122
+      ],
+      "turn_interval": [
+        8.5,
+        14.5
+      ],
+      "rest_chance": 0.08,
+      "rest_duration": [
+        0.8,
+        1.8
+      ],
+      "observe_chance": 0.2,
+      "observe_duration": [
+        3.8,
+        7.2
+      ],
+      "observe_radius": 0.38,
+      "social_goal_chance": 0.035,
+      "relationship_goal_gain": 0.52,
+      "max_social_goal_chance": 0.24,
+      "preferred_social_distance": 0.24,
+      "social_jitter": 0.025,
+      "interaction_chance": 0.3,
+      "interaction_distance": 0.085,
+      "social_duration": [
+        1.0,
+        1.8
+      ],
+      "social_cooldown": [
+        10.0,
+        17.0
+      ],
+      "repeat_partner_cooldown": [
+        24.0,
+        38.0
+      ],
+      "post_social_roam": [
+        9.0,
+        15.0
+      ],
+      "crowd_avoidance": 0.74,
+      "crowd_radius": 0.33,
+      "avoidance_distance": 0.36,
+      "depth_bias": 0.56,
+      "depth_variance": 0.2,
+      "burst_after_pause_chance": 0.02,
+      "burst_after_social_chance": 0.01,
+      "burst_multiplier": 1.1,
+      "burst_duration": [
+        0.6,
+        1.0
+      ],
+      "speech_style": "stern",
+      "conversation_join_chance": 0.02,
+      "conversation_join_radius": 0.2,
+      "conversation_speakiness": 0.62,
+      "typing_speed": [
+        10,
+        14
+      ],
+      "conversation_turn_pause": [
+        0.65,
+        1.0
+      ],
+      "conversation_turns": [
+        3,
+        5
+      ]
+    },
+    "specter_fervent_chaotic_hunter": {
+      "behavior": "wander",
+      "behavior_mix": {
+        "wander": 0.34,
+        "local_wander": 0.28,
+        "drifter": 0.18,
+        "patrol": 0.12,
+        "perimeter": 0.08
+      },
+      "speed": [
+        0.078,
+        0.118
+      ],
+      "turn_interval": [
+        2.4,
+        5.6
+      ],
+      "rest_chance": 0.14,
+      "rest_duration": [
+        0.6,
+        1.4
+      ],
+      "observe_chance": 0.1,
+      "observe_duration": [
+        1.4,
+        3.0
+      ],
+      "observe_radius": 0.3,
+      "social_goal_chance": 0.11,
+      "relationship_goal_gain": 0.62,
+      "max_social_goal_chance": 0.34,
+      "preferred_social_distance": 0.18,
+      "social_jitter": 0.05,
+      "interaction_chance": 0.56,
+      "interaction_distance": 0.092,
+      "social_duration": [
+        1.2,
+        2.3
+      ],
+      "social_cooldown": [
+        6.0,
+        10.0
+      ],
+      "repeat_partner_cooldown": [
+        16.0,
+        26.0
+      ],
+      "post_social_roam": [
+        5.0,
+        9.0
+      ],
+      "crowd_avoidance": 0.18,
+      "crowd_radius": 0.26,
+      "avoidance_distance": 0.24,
+      "depth_bias": 0.57,
+      "depth_variance": 0.28,
+      "burst_after_pause_chance": 0.24,
+      "burst_after_social_chance": 0.18,
+      "burst_multiplier": 1.42,
+      "burst_duration": [
+        0.8,
+        1.5
+      ],
+      "speech_style": "chaotic",
+      "conversation_join_chance": 0.12,
+      "conversation_join_radius": 0.26,
+      "conversation_speakiness": 1.12,
+      "typing_speed": [
+        15,
+        21
+      ],
+      "conversation_turn_pause": [
+        0.32,
+        0.65
+      ],
+      "conversation_turns": [
+        4,
+        8
+      ]
     }
   },
   "characters": {
@@ -307,15 +547,113 @@
       ],
       "profile": "spuria_active_social_wanderer",
       "speed_multiplier": 1.0
+    },
+    "gla-dia": {
+      "display_name": "歌蕾蒂娅",
+      "aliases": [
+        "gladiia",
+        "歌蕾蒂娅"
+      ],
+      "profile": "gladiia_disciplined_hunter",
+      "speed_multiplier": 1.0
+    },
+    "specter": {
+      "display_name": "幽灵鲨",
+      "aliases": [
+        "specter",
+        "幽灵鲨"
+      ],
+      "profile": "specter_fervent_chaotic_hunter",
+      "speed_multiplier": 1.0
     }
   },
   "relationships": {
+    "lmun": {
+      "spuria": {
+        "label": "高亲密度/亲近学妹与长期熟人",
+        "weight": 1.85
+      },
+      "ishar-mla": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "gla-dia": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "specter": {
+        "label": "友好同事",
+        "weight": 1.0
+      }
+    },
     "spuria": {
       "lmun": {
         "label": "高亲密度/亲近学姐与长期熟人",
         "weight": 1.85
       },
       "ishar-mla": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "gla-dia": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "specter": {
+        "label": "友好同事",
+        "weight": 1.0
+      }
+    },
+    "ishar-mla": {
+      "lmun": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "spuria": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "gla-dia": {
+        "label": "高亲密度/深海猎人同伴与重要上级",
+        "weight": 2.05
+      },
+      "specter": {
+        "label": "高亲密度/深海猎人同伴",
+        "weight": 1.9
+      }
+    },
+    "gla-dia": {
+      "ishar-mla": {
+        "label": "高亲密度/深海猎人同伴与重要部下、明显关心但表达严厉",
+        "weight": 2.05
+      },
+      "lmun": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "spuria": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "specter": {
+        "label": "高亲密度/同伴与重要成员",
+        "weight": 1.95
+      }
+    },
+    "specter": {
+      "gla-dia": {
+        "label": "高亲密度/队长与同伴",
+        "weight": 1.95
+      },
+      "ishar-mla": {
+        "label": "高亲密度/深海猎人同伴",
+        "weight": 1.9
+      },
+      "lmun": {
+        "label": "友好同事",
+        "weight": 1.0
+      },
+      "spuria": {
         "label": "友好同事",
         "weight": 1.0
       }

@@ -1326,6 +1326,8 @@ class PlaygroundCanvas(QWidget):
         self._actors = []
         self._selected = -1
         self._asset_error = ''
+        self._conversations = []
+        self._next_conversation_id = 1
         self._personality_data = self._load_personalities()
         self._discover_and_load_actors()
 
@@ -1601,6 +1603,8 @@ class PlaygroundCanvas(QWidget):
                 'move_speed': 0.0,
                 'perimeter_index': index % 4,
                 'perimeter_reverse': bool(index % 2),
+                'conversation_id': None,
+                'conversation_role': None,
             }
             self._actors.append(actor)
             self._set_actor_mode(actor, 'relax')
@@ -1773,10 +1777,291 @@ class PlaygroundCanvas(QWidget):
         weight = self._relationship(actor, other)['weight']
         return max(0.7, ((a + b) * 0.5) * min(1.45, 0.90 + 0.16 * weight))
 
+    def _conversation_by_id(self, conversation_id):
+        if not conversation_id:
+            return None
+        for conversation in self._conversations:
+            if conversation.get('id') == conversation_id:
+                return conversation
+        return None
+
+    def _conversation_members(self, conversation):
+        members = []
+        ids = set(conversation.get('participants') or [])
+        for actor in self._actors:
+            if actor.get('id') in ids and actor.get('conversation_id') == conversation.get('id'):
+                members.append(actor)
+        return members
+
+    def _conversation_centroid(self, conversation):
+        members = self._conversation_members(conversation)
+        if not members:
+            return 0.5, 0.5
+        return (
+            sum(actor['x'] for actor in members) / len(members),
+            sum(actor['depth'] for actor in members) / len(members),
+        )
+
+    def _speech_style_for(self, actor):
+        style = str(actor['profile'].get('speech_style', 'neutral')).strip().lower()
+        if style:
+            return style
+        social = float(actor['profile'].get('conversation_join_chance', 0.0) or 0.0)
+        if social >= 0.22:
+            return 'lively'
+        if social <= 0.05:
+            return 'brief'
+        return 'neutral'
+
+    def _generate_gibberish(self, actor):
+        style = self._speech_style_for(actor)
+        if style == 'chaotic':
+            alphabet = list('xzvnmkrst#%&*@!?/\\|~+-=')
+            groups = random.randint(7, 14)
+            width = (2, 5)
+        elif style == 'lively':
+            alphabet = list('aeiourstlmnpqyz<>[]{}?!+-=*')
+            groups = random.randint(6, 12)
+            width = (3, 6)
+        elif style == 'brief':
+            alphabet = list('mnrstlvx.-_?')
+            groups = random.randint(3, 6)
+            width = (2, 4)
+        elif style == 'stern':
+            alphabet = list('TRKLVMNXYZ/\\|-+*')
+            groups = random.randint(4, 8)
+            width = (2, 5)
+        else:
+            alphabet = list('aemnorstuvxyz#?+-=')
+            groups = random.randint(4, 9)
+            width = (2, 5)
+        chunks = []
+        for _ in range(groups):
+            n = random.randint(width[0], width[1])
+            chunks.append(''.join(random.choice(alphabet) for _ in range(n)))
+        line = ' '.join(chunks)
+        if random.random() < 0.35:
+            line += random.choice([' ...', ' ??', ' !!', ' ~'])
+        return line
+
+    def _conversation_turn_limit(self, participants, duration):
+        low, high = 4.0, 8.0
+        weights = []
+        for actor in participants:
+            turns = actor['profile'].get('conversation_turns')
+            if isinstance(turns, (list, tuple)) and len(turns) >= 2:
+                try:
+                    weights.append((float(turns[0]), float(turns[1])))
+                except (TypeError, ValueError):
+                    pass
+        if weights:
+            low = sum(pair[0] for pair in weights) / len(weights)
+            high = sum(pair[1] for pair in weights) / len(weights)
+        base = random.randint(max(2, int(round(low))), max(3, int(round(high))))
+        bonus = int(max(0.0, duration - 1.0) * 1.35)
+        return max(3, base + bonus)
+
+    def _conversation_speaker_weights(self, conversation):
+        members = self._conversation_members(conversation)
+        last_id = conversation.get('speaker_id')
+        weighted = []
+        for actor in members:
+            weight = float(actor['profile'].get('conversation_speakiness', 1.0) or 1.0)
+            if actor.get('id') == last_id and len(members) > 1:
+                weight *= 0.24
+            weight = max(0.05, weight)
+            weighted.append((actor, weight))
+        return weighted
+
+    def _speaker_animation_mode(self, actor):
+        if 'social' in actor['movies'] and random.random() < 0.20:
+            return 'social'
+        return 'relax'
+
+    def _begin_conversation_turn(self, conversation, speaker=None):
+        members = self._conversation_members(conversation)
+        if len(members) < 2:
+            self._end_conversation(conversation)
+            return
+        if speaker is None:
+            weighted = self._conversation_speaker_weights(conversation)
+            total = sum(weight for _actor, weight in weighted)
+            pick = random.random() * total if total > 0 else 0.0
+            speaker = weighted[-1][0]
+            for actor, weight in weighted:
+                pick -= weight
+                if pick <= 0:
+                    speaker = actor
+                    break
+        conversation['speaker_id'] = speaker['id']
+        conversation['text'] = self._generate_gibberish(speaker)
+        conversation['shown_text'] = ''
+        conversation['char_progress'] = 0.0
+        conversation['state'] = 'typing'
+        conversation['pause_timer'] = 0.0
+        conversation['typing_speed'] = max(
+            8.0,
+            self._range_value(speaker['profile'].get('typing_speed'), 18.0)
+        )
+        center_x, center_depth = self._conversation_centroid(conversation)
+        for actor in members:
+            actor['interaction_mode'] = 'relax'
+            if abs(center_x - actor['x']) > 0.01:
+                actor['facing'] = 1 if center_x > actor['x'] else -1
+        speaker['interaction_mode'] = self._speaker_animation_mode(speaker)
+        conversation['join_check_timer'] = min(conversation.get('join_check_timer', 1.6), 1.6)
+
+    def _start_conversation(self, actor, other, duration):
+        conversation = {
+            'id': self._next_conversation_id,
+            'participants': [actor['id'], other['id']],
+            'anchor_pair': [actor['id'], other['id']],
+            'speaker_id': None,
+            'text': '',
+            'shown_text': '',
+            'char_progress': 0.0,
+            'typing_speed': 16.0,
+            'pause_timer': 0.0,
+            'state': 'typing',
+            'turn_index': 0,
+            'max_turns': self._conversation_turn_limit([actor, other], duration),
+            'join_check_timer': random.uniform(1.1, 2.1),
+        }
+        self._next_conversation_id += 1
+        self._conversations.append(conversation)
+        actor['conversation_id'] = conversation['id']
+        other['conversation_id'] = conversation['id']
+        actor['conversation_role'] = 'anchor'
+        other['conversation_role'] = 'anchor'
+        self._begin_conversation_turn(conversation, random.choice([actor, other]))
+        return conversation
+
+    def _end_conversation(self, conversation):
+        if isinstance(conversation, int):
+            conversation = self._conversation_by_id(conversation)
+        if conversation is None:
+            return
+        members = self._conversation_members(conversation)
+        if conversation in self._conversations:
+            self._conversations.remove(conversation)
+        for actor in members:
+            for other in members:
+                if other is actor:
+                    continue
+                cooldown = self._range_value(
+                    actor['profile'].get('repeat_partner_cooldown'), 16.0)
+                actor.setdefault('recent_social', {})[other['id']] = cooldown
+            actor['conversation_id'] = None
+            actor['conversation_role'] = None
+            actor['interaction_partner'] = None
+            actor['interaction_timer'] = 0.0
+            actor['interaction_mode'] = None
+            actor['social_cooldown'] = self._range_value(
+                actor['profile'].get('social_cooldown'), 5.0)
+            actor['post_social_roam_timer'] = self._range_value(
+                actor['profile'].get('post_social_roam'), 7.0)
+            chance = float(
+                actor['profile'].get('burst_after_social_chance', 0.0) or 0.0)
+            if random.random() < chance:
+                actor['burst_timer'] = self._range_value(
+                    actor['profile'].get('burst_duration'), 1.5)
+            actor['target_actor_id'] = None
+            actor['ai_timer'] = 0.0
+            self._set_actor_mode(actor, 'sleep' if actor.get('sleeping') else 'relax')
+
+    def _leave_conversation(self, actor):
+        conversation = self._conversation_by_id(actor.get('conversation_id'))
+        if conversation is not None:
+            self._end_conversation(conversation)
+        else:
+            actor['conversation_id'] = None
+            actor['conversation_role'] = None
+
+    def _maybe_join_conversation(self, conversation):
+        members = self._conversation_members(conversation)
+        if len(members) < 2:
+            return False
+        center_x, center_depth = self._conversation_centroid(conversation)
+        candidates = []
+        for actor in self._actors:
+            if actor.get('sleeping') or actor.get('conversation_id'):
+                continue
+            if actor.get('interaction_partner'):
+                continue
+            if 0 <= self._selected < len(self._actors) and self._actors[self._selected] is actor and self._keys:
+                continue
+            profile = actor['profile']
+            base = float(profile.get('conversation_join_chance', 0.06) or 0.06)
+            if base <= 0:
+                continue
+            near = min(self._world_distance(actor, other) for other in members)
+            radius = float(profile.get('conversation_join_radius', 0.24) or 0.24)
+            if near > radius:
+                continue
+            social_weight = max(self._relationship(actor, other)['weight'] for other in members)
+            crowd_penalty = max(0.45, 1.0 - 0.10 * max(0, len(members) - 2))
+            chance = min(0.72, base * (0.72 + 0.36 * social_weight) * crowd_penalty)
+            candidates.append((actor, chance, abs(actor['x'] - center_x) + abs(actor['depth'] - center_depth)))
+        candidates.sort(key=lambda item: item[2])
+        for actor, chance, _priority in candidates:
+            if random.random() < chance:
+                actor['conversation_id'] = conversation['id']
+                actor['conversation_role'] = 'joiner'
+                actor['target_actor_id'] = None
+                actor['target_reason'] = 'conversation'
+                actor['rest_timer'] = 0.0
+                actor['ai_timer'] = 0.0
+                actor['interaction_mode'] = 'relax'
+                if actor['id'] not in conversation['participants']:
+                    conversation['participants'].append(actor['id'])
+                actor['facing'] = 1 if center_x > actor['x'] else -1
+                return True
+        return False
+
+    def _tick_conversations(self, dt):
+        for conversation in list(self._conversations):
+            members = self._conversation_members(conversation)
+            if len(members) < 2:
+                self._end_conversation(conversation)
+                continue
+
+            conversation['join_check_timer'] = max(
+                0.0, float(conversation.get('join_check_timer', 0.0)) - dt)
+            if conversation['join_check_timer'] <= 0:
+                conversation['join_check_timer'] = random.uniform(1.2, 2.6)
+                self._maybe_join_conversation(conversation)
+
+            state = conversation.get('state', 'typing')
+            speaker = self._actor_by_id(conversation.get('speaker_id'))
+            if speaker is None or speaker.get('conversation_id') != conversation.get('id'):
+                self._begin_conversation_turn(conversation)
+                continue
+
+            if state == 'typing':
+                text = conversation.get('text', '')
+                conversation['char_progress'] += float(conversation.get('typing_speed', 16.0)) * dt
+                visible = min(len(text), int(conversation['char_progress']))
+                conversation['shown_text'] = text[:visible]
+                if visible >= len(text):
+                    conversation['state'] = 'pause'
+                    pause = self._range_value(
+                        speaker['profile'].get('conversation_turn_pause'), 0.62)
+                    conversation['pause_timer'] = max(0.18, pause)
+            else:
+                conversation['pause_timer'] = max(0.0, float(conversation.get('pause_timer', 0.0)) - dt)
+                if conversation['pause_timer'] <= 0:
+                    conversation['turn_index'] = int(conversation.get('turn_index', 0)) + 1
+                    if conversation['turn_index'] >= int(conversation.get('max_turns', 5)):
+                        self._end_conversation(conversation)
+                        continue
+                    self._begin_conversation_turn(conversation)
+
     def _start_social_interaction(self, actor, other):
         if actor is other or actor.get('sleeping') or other.get('sleeping'):
             return False
         if actor.get('interaction_partner') or other.get('interaction_partner'):
+            return False
+        if actor.get('conversation_id') or other.get('conversation_id'):
             return False
         if self._selected >= 0:
             selected = self._actors[self._selected]
@@ -1798,29 +2083,24 @@ class PlaygroundCanvas(QWidget):
         other['target_actor_id'] = None
         actor['facing'] = 1 if other['x'] >= actor['x'] else -1
         other['facing'] = 1 if actor['x'] >= other['x'] else -1
-
-        # During a social encounter, each actor uses normal relax 80% of the time
-        # and its dedicated _in animation 20% of the time.
-        for participant in (actor, other):
-            use_in = ('social' in participant['movies'] and random.random() < 0.20)
-            participant['interaction_mode'] = 'social' if use_in else 'relax'
-            self._set_actor_mode(participant, participant['interaction_mode'])
+        self._start_conversation(actor, other, duration)
         return True
 
     def _end_social_interaction(self, actor):
+        conversation = self._conversation_by_id(actor.get('conversation_id'))
+        if conversation is not None:
+            self._end_conversation(conversation)
+            return
+
         partner_id = actor.get('interaction_partner')
         partner = self._actor_by_id(partner_id) if partner_id else None
         pair = [actor] + ([partner] if partner is not None else [])
-
-        # Relationship remains meaningful, but this pair now gets a substantial
-        # temporary memory cooldown so they do not immediately separate and reunite.
         for participant in pair:
             other = partner if participant is actor else actor
             if other is not None:
                 cooldown = self._range_value(
                     participant['profile'].get('repeat_partner_cooldown'), 16.0)
                 participant.setdefault('recent_social', {})[other['id']] = cooldown
-
             participant['interaction_partner'] = None
             participant['interaction_timer'] = 0.0
             participant['interaction_mode'] = None
@@ -1829,15 +2109,11 @@ class PlaygroundCanvas(QWidget):
             participant['post_social_roam_timer'] = self._range_value(
                 participant['profile'].get('post_social_roam'), 7.0)
             self._set_actor_mode(participant, 'relax')
-
-            # Personality-specific departure bursts remain possible, but are not guaranteed.
             chance = float(
                 participant['profile'].get('burst_after_social_chance', 0.0) or 0.0)
             if random.random() < chance:
                 participant['burst_timer'] = self._range_value(
                     participant['profile'].get('burst_duration'), 1.5)
-
-            # Force a normal non-social destination next.
             participant['target_actor_id'] = None
             participant['ai_timer'] = 0.0
 
@@ -1941,8 +2217,8 @@ class PlaygroundCanvas(QWidget):
 
     def _tick_ai(self, actor, dt):
         if actor['sleeping']:
-            if actor.get('interaction_partner'):
-                self._end_social_interaction(actor)
+            if actor.get('interaction_partner') or actor.get('conversation_id'):
+                self._leave_conversation(actor)
             self._set_actor_mode(actor, 'sleep')
             return
 
@@ -1959,17 +2235,29 @@ class PlaygroundCanvas(QWidget):
             if recent[partner_id] <= 0:
                 recent.pop(partner_id, None)
 
+        conversation = self._conversation_by_id(actor.get('conversation_id'))
         if actor.get('interaction_partner'):
-            actor['interaction_timer'] = max(
-                0.0, actor.get('interaction_timer', 0.0) - dt)
             partner = self._actor_by_id(actor['interaction_partner'])
-            if actor['interaction_timer'] <= 0 or partner is None:
+            if conversation is None or partner is None:
                 self._end_social_interaction(actor)
             else:
                 mode = actor.get('interaction_mode') or 'relax'
                 if mode not in actor['movies']:
                     mode = 'relax'
+                cx, _cy = self._conversation_centroid(conversation)
+                if abs(cx - actor['x']) > 0.01:
+                    actor['facing'] = 1 if cx > actor['x'] else -1
                 self._set_actor_mode(actor, mode)
+            return
+
+        if conversation is not None:
+            mode = actor.get('interaction_mode') or 'relax'
+            if mode not in actor['movies']:
+                mode = 'relax'
+            cx, _cy = self._conversation_centroid(conversation)
+            if abs(cx - actor['x']) > 0.01:
+                actor['facing'] = 1 if cx > actor['x'] else -1
+            self._set_actor_mode(actor, mode)
             return
 
         if actor['rest_timer'] > 0:
@@ -2045,10 +2333,11 @@ class PlaygroundCanvas(QWidget):
             return
 
         moving = bool(self._keys & {Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D})
-        if moving and actor.get('interaction_partner'):
-            self._end_social_interaction(actor)
+        if moving and actor.get('conversation_id'):
+            self._leave_conversation(actor)
         if not moving:
-            if actor.get('interaction_partner'):
+            conversation = self._conversation_by_id(actor.get('conversation_id'))
+            if conversation is not None:
                 mode = actor.get('interaction_mode') or 'relax'
                 if mode not in actor['movies']:
                     mode = 'relax'
@@ -2082,11 +2371,10 @@ class PlaygroundCanvas(QWidget):
             else:
                 self._tick_ai(actor, dt)
 
-            # Invisible collision planes.
-            # Invisible collision planes in normalized world coordinates.
             actor['x'] = max(0.07, min(0.93, actor['x']))
             actor['depth'] = max(0.10, min(0.93, actor['depth']))
 
+        self._tick_conversations(dt)
         self.update()
 
     def keyPressEvent(self, event):
@@ -2290,6 +2578,69 @@ class PlaygroundCanvas(QWidget):
             actor_h,
         )
 
+    def _draw_conversation_bubble(self, painter, actor, conversation):
+        text = conversation.get('shown_text') or conversation.get('text') or ''
+        if not text:
+            return
+        dest = actor.get('rect') or QRectF()
+        if dest.isNull():
+            return
+
+        font = painter.font()
+        font.setPointSizeF(max(9.2, min(12.8, dest.height() * 0.10)))
+        painter.save()
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        max_width = min(max(180, int(self.width() * 0.22)), 320)
+        text_rect = fm.boundingRect(QRect(0, 0, max_width, 600), Qt.TextWordWrap, text)
+        bubble = QRectF(
+            dest.center().x() - text_rect.width() / 2.0 - 14,
+            max(8.0, dest.top() - text_rect.height() - 40),
+            text_rect.width() + 28,
+            text_rect.height() + 20,
+        )
+        bubble.translate(0, min(0.0, self.width() - 8 - bubble.right()))
+        if bubble.left() < 8:
+            bubble.moveLeft(8)
+        if bubble.right() > self.width() - 8:
+            bubble.moveRight(self.width() - 8)
+
+        fill = QColor(236, 239, 244, 205)
+        border = QColor(160, 168, 178, 212)
+        text_color = QColor(44, 49, 58, 242)
+        if ACTIVE_THEME == 'night':
+            fill = QColor(224, 227, 232, 190)
+            border = QColor(192, 198, 208, 212)
+            text_color = QColor(24, 28, 36, 245)
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(bubble, 11, 11)
+
+        tail_x = max(bubble.left() + 18, min(dest.center().x(), bubble.right() - 18))
+        tail = QPainterPath()
+        tail.moveTo(tail_x - 9, bubble.bottom() - 1)
+        tail.lineTo(tail_x + 8, bubble.bottom() - 1)
+        tail.lineTo(dest.center().x(), min(self.height() - 6.0, dest.top() - 8))
+        tail.closeSubpath()
+        painter.fillPath(tail, fill)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawPath(tail)
+
+        painter.setPen(text_color)
+        painter.drawText(
+            bubble.adjusted(14, 10, -14, -10),
+            Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
+        painter.restore()
+
+    def _draw_conversations(self, painter):
+        for conversation in self._conversations:
+            speaker = self._actor_by_id(conversation.get('speaker_id'))
+            if speaker is None or speaker.get('conversation_id') != conversation.get('id'):
+                continue
+            self._draw_conversation_bubble(painter, speaker, conversation)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -2305,7 +2656,6 @@ class PlaygroundCanvas(QWidget):
                              Qt.AlignCenter | Qt.TextWordWrap, message)
             return
 
-        # Far actors first, near actors last.
         order = sorted(range(len(self._actors)), key=lambda i: self._actors[i]['depth'])
         for index in order:
             actor = self._actors[index]
@@ -2327,6 +2677,7 @@ class PlaygroundCanvas(QWidget):
             painter.drawPixmap(dest, frame, source)
             painter.restore()
 
+        self._draw_conversations(painter)
 
 class PlaygroundPage(QWidget):
     backRequested = Signal()
@@ -2343,7 +2694,7 @@ class PlaygroundPage(QWidget):
         title.setStyleSheet('font-size:24px; font-weight:700;')
         header.addWidget(title)
         header.addStretch()
-        hint = QLabel(TXT('左键选择角色 · WASD 移动 · 右键：睡觉/叫醒', 'Left-click to select · WASD move · Right-click: sleep/wake'))
+        hint = QLabel(TXT('左键选择角色 · WASD 移动 · 右键：睡觉/叫醒 · 角色会自动对话', 'Left-click to select · WASD move · Right-click: sleep/wake · actors can chat'))
         header.addWidget(hint)
         outer.addLayout(header)
         self.canvas = PlaygroundCanvas(self)
