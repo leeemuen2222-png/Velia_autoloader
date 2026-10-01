@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
 import monster_siren_client as siren
+from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, Property, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QImage, QImageReader, QMovie, QPainter, QPainterPath, QPalette, QPen, QPixmap, QRegion
@@ -55,6 +56,8 @@ RESOURCE_GIF_DIR = RESOURCE_DIR / "gif"
 SETTINGS_FILE = PREFERENCE_DIR / "settings.json"
 LIBRARY_STATE_FILE = PREFERENCE_DIR / "library_state.json"
 PLAYGROUND_AFFECTION_FILE = PREFERENCE_DIR / "playground_affection.json"
+MULTIPLAYER_SERVER_URL = os.environ.get("VELIA_MULTIPLAYER_URL", "ws://127.0.0.1:8765")
+MULTIPLAYER_ROOM_ID = os.environ.get("VELIA_MULTIPLAYER_ROOM", "public-01")
 APP_SETTINGS = {"language": "zh"}
 ACTIVE_THEME = "night"
 
@@ -3580,6 +3583,7 @@ class PlaygroundCanvas(QWidget):
 class PlaygroundPage(QWidget):
     backRequested = Signal()
     themeRequested = Signal(str)
+    multiplayerRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3594,10 +3598,13 @@ class PlaygroundPage(QWidget):
         header.addWidget(title)
         header.addStretch()
 
+        self.multiplayer_btn = FloatingButton(TXT('联机房间', 'Multiplayer Room'))
         self.night_btn = FloatingButton(TXT('天黑了', 'Night falls'))
         self.day_btn = FloatingButton(TXT('天亮了', 'Day breaks'))
+        header.addWidget(self.multiplayer_btn)
         header.addWidget(self.night_btn)
         header.addWidget(self.day_btn)
+        self.multiplayer_btn.clicked.connect(self.multiplayerRequested)
 
         hint = QLabel(TXT('左键选择角色 · WASD 移动 · R 释放控制 · Enter 输入/发送 · Ctrl+S 社交记录 · 右键：睡觉/叫醒', 'Left-click to select · WASD move · R release control · Enter type/send · Ctrl+S social history · Right-click: sleep/wake'))
         header.addWidget(hint)
@@ -3612,6 +3619,727 @@ class PlaygroundPage(QWidget):
             lambda: self.canvas.begin_daylight_transition('day')
         )
         outer.addWidget(self.canvas, 1)
+
+
+class MultiplayerCanvas(QWidget):
+    """Human-only multiplayer room.
+
+    Local user is always in control. Remote users are rendered from synchronized
+    network state. There is no AI, release-control command, affection, or
+    automatic social system in this room.
+    """
+
+    backRequested = Signal()
+
+    def __init__(self, actor_assets, operator_id, nickname, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.setMinimumHeight(560)
+
+        self.actor_assets = {
+            actor['id'].casefold(): actor
+            for actor in actor_assets
+        }
+
+        # Multiplayer renders remote actors independently from the local AI canvas.
+        # Keep both move/relax movies alive so every client sees actual animated GIF
+        # playback rather than a frozen frame from a stopped QMovie.
+        for asset in self.actor_assets.values():
+            for mode in ('move', 'relax'):
+                movie = (asset.get('movies') or {}).get(mode)
+                if movie is not None:
+                    movie.start()
+
+        self.local_operator = operator_id.casefold()
+        self.nickname = nickname
+        self.room_id = MULTIPLAYER_ROOM_ID
+        self.local_player_id = None
+        self.players = {}
+        self._keys = set()
+        self._chat_history = []
+        self._chat_bubbles = {}
+        self._seen_chat_ids = set()
+        self._local_chat_sequence = 0
+        self._state_send_accum = 0.0
+        self._last_sent_state = None
+
+        self._local = {
+            'player_id': '__local__',
+            'username': nickname,
+            'operator': self.local_operator,
+            'x': 0.50,
+            'depth': 0.62,
+            'facing': 1,
+            'animation': 'relax',
+            'display_animation': 'relax',
+            'target_x': 0.50,
+            'target_depth': 0.62,
+            'display_x': 0.50,
+            'display_depth': 0.62,
+        }
+
+        self.status = TXT('正在连接联机房间…', 'Connecting to multiplayer room…')
+
+        self._speech_editor = QTextEdit(self)
+        self._speech_editor.setAcceptRichText(False)
+        self._speech_editor.setPlaceholderText(
+            TXT('输入消息… 再按 Enter 发送 · Shift+Enter 换行',
+                'Type a message… press Enter again to send · Shift+Enter newline')
+        )
+        self._speech_editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._speech_editor.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._speech_editor.setLineWrapMode(QTextEdit.WidgetWidth)
+        self._speech_editor.setStyleSheet(
+            'QTextEdit {'
+            ' background: rgba(232,235,240,225);'
+            ' color:#252a33;'
+            ' border:1px solid rgba(150,158,170,220);'
+            ' border-radius:11px;'
+            ' padding:8px 10px;'
+            '}'
+        )
+        self._speech_editor.hide()
+        self._speech_editor.installEventFilter(self)
+        self._speech_editor.textChanged.connect(self._resize_editor)
+
+        self.client = MultiplayerClient(self)
+        self.client.connected.connect(self._network_connected)
+        self.client.disconnected.connect(self._network_disconnected)
+        self.client.connectionError.connect(self._network_error)
+        self.client.messageReceived.connect(self._network_message)
+
+        self._clock = QTimer(self)
+        self._clock.setInterval(16)
+        self._clock.timeout.connect(self._tick)
+        self._clock.start()
+
+        self.client.connect_to(MULTIPLAYER_SERVER_URL)
+
+    def close_room(self):
+        self.client.close()
+
+    def _asset(self, operator_id):
+        return self.actor_assets.get(str(operator_id).casefold())
+
+    def _network_connected(self):
+        self.status = TXT('已连接，正在加入房间…', 'Connected, joining room…')
+        self.client.send({
+            'type': 'join',
+            'data': {
+                'room_id': self.room_id,
+                'username': self.nickname,
+                'operator': self.local_operator,
+            }
+        })
+        self.update()
+
+    def _network_disconnected(self):
+        self.status = TXT('已与房间断开连接', 'Disconnected from room')
+        self.update()
+
+    def _network_error(self, message):
+        self.status = TXT(
+            f'联机不可用：{message}',
+            f'Multiplayer unavailable: {message}'
+        )
+        self.update()
+
+    def _network_message(self, packet):
+        kind = packet.get('type')
+        data = packet.get('data') or {}
+
+        if kind == 'welcome':
+            self.local_player_id = data.get('player_id')
+            self._local['player_id'] = self.local_player_id or '__local__'
+            self.players = {}
+            for state in data.get('players') or []:
+                self._upsert_remote(state, immediate=True)
+            self.status = TXT(
+                f'已加入 {data.get("room_id", self.room_id)}',
+                f'Joined {data.get("room_id", self.room_id)}'
+            )
+
+        elif kind == 'player_joined':
+            self._upsert_remote(data, immediate=True)
+
+        elif kind == 'player_left':
+            self.players.pop(str(data.get('player_id')), None)
+
+        elif kind == 'state':
+            self._upsert_remote(data, immediate=False)
+
+        elif kind == 'chat':
+            username = str(data.get('username', '')).strip() or TXT('匿名', 'Anonymous')
+            message = str(data.get('message', '')).strip()
+            player_id = str(data.get('player_id', ''))
+            message_id = str(data.get('message_id', '')).strip()
+
+            if message and (not message_id or message_id not in self._seen_chat_ids):
+                if message_id:
+                    self._seen_chat_ids.add(message_id)
+                    if len(self._seen_chat_ids) > 1200:
+                        self._seen_chat_ids = set(list(self._seen_chat_ids)[-800:])
+
+                self._chat_history.append({
+                    'username': username,
+                    'message': message,
+                    'message_id': message_id,
+                })
+                self._chat_history = self._chat_history[-600:]
+
+                # This is keyed by the speaking player's network id, therefore
+                # every connected client shows the same exact input above the
+                # same remote/local avatar.
+                self._chat_bubbles[player_id] = {
+                    'text': message,
+                    'expires_at': time.monotonic() + 2.35,
+                }
+
+        elif kind == 'error':
+            self.status = TXT(
+                f'服务器错误：{packet.get("message", "")}',
+                f'Server error: {packet.get("message", "")}'
+            )
+
+        self.update()
+
+    def _upsert_remote(self, data, immediate=False):
+        player_id = str(data.get('player_id', ''))
+        if not player_id or player_id == self.local_player_id:
+            return
+        if self._asset(data.get('operator')) is None:
+            return
+
+        current = self.players.get(player_id)
+        x = max(0.07, min(0.93, float(data.get('x', 0.5))))
+        depth = max(0.10, min(0.93, float(data.get('depth', 0.62))))
+        if current is None:
+            current = {
+                'player_id': player_id,
+                'username': str(data.get('username', '')),
+                'operator': str(data.get('operator', '')).casefold(),
+                'x': x,
+                'depth': depth,
+                'display_x': x,
+                'display_depth': depth,
+                'facing': -1 if int(data.get('facing', 1)) < 0 else 1,
+                'animation': str(data.get('animation', 'relax')),
+                'display_animation': str(data.get('animation', 'relax')),
+            }
+            self.players[player_id] = current
+        else:
+            current['username'] = str(data.get('username', current['username']))
+            current['operator'] = str(data.get('operator', current['operator'])).casefold()
+            current['x'] = x
+            current['depth'] = depth
+            current['facing'] = -1 if int(data.get('facing', 1)) < 0 else 1
+            current['animation'] = str(data.get('animation', 'relax'))
+            if immediate:
+                current['display_x'] = x
+                current['display_depth'] = depth
+
+    def _room_geometry(self):
+        w, h = float(self.width()), float(self.height())
+        return {
+            'front_left': w * 0.045,
+            'front_right': w * 0.955,
+            'floor_bottom': h * 0.965,
+            'back_left': w * 0.255,
+            'back_right': w * 0.745,
+            'back_top': h * 0.085,
+            'back_bottom': h * 0.355,
+        }
+
+    def _floor_bounds_at_depth(self, depth):
+        room = self._room_geometry()
+        t = max(0.0, min(1.0, float(depth)))
+        left = room['back_left'] + (room['front_left'] - room['back_left']) * t
+        right = room['back_right'] + (room['front_right'] - room['back_right']) * t
+        return left, right
+
+    def _ground_y_at_depth(self, depth):
+        room = self._room_geometry()
+        t = max(0.0, min(1.0, float(depth)))
+        return (
+            room['back_bottom']
+            + (room['floor_bottom'] - room['back_bottom']) * (t ** 1.72)
+        )
+
+    def _world_actor_height(self, depth):
+        room = self._room_geometry()
+        back_width = max(1.0, room['back_right'] - room['back_left'])
+        front_width = max(1.0, room['front_right'] - room['front_left'])
+        left, right = self._floor_bounds_at_depth(depth)
+        width_here = max(1.0, right - left)
+        denom = max(1.0, front_width - back_width)
+        perspective = max(0.0, min(1.0, (width_here - back_width) / denom))
+        scale = 0.46 + 0.54 * perspective
+        return min(300.0, max(230.0, self.height() * 0.34)) * scale
+
+    def _destination(self, player):
+        asset = self._asset(player.get('operator'))
+        if asset is None:
+            return QRectF()
+        source = asset.get('source_rect') or QRect()
+        if source.isNull() or source.height() <= 0:
+            return QRectF()
+
+        depth = player.get('display_depth', player.get('depth', 0.6))
+        x = player.get('display_x', player.get('x', 0.5))
+        h = self._world_actor_height(depth)
+        w = h * source.width() / max(1.0, source.height())
+        left, right = self._floor_bounds_at_depth(depth)
+        cx = left + (right - left) * x
+        gy = self._ground_y_at_depth(depth)
+        return QRectF(cx - w / 2.0, gy - h, w, h)
+
+    def _draw_grid(self, painter):
+        day = ACTIVE_THEME == 'day'
+        bg = QColor('#eef8ff' if day else '#06080b')
+        wall_fill = QColor('#e7f4fd' if day else '#090d12')
+        floor_fill = QColor('#edf8ff' if day else '#070a0e')
+        major = QColor(35,145,220,125) if day else QColor(195,210,230,82)
+        minor = QColor(60,165,225,58) if day else QColor(145,160,180,42)
+
+        painter.fillRect(self.rect(), bg)
+        room = self._room_geometry()
+        bl, br = room['back_left'], room['back_right']
+        bt, bb = room['back_top'], room['back_bottom']
+        fl, fr = room['front_left'], room['front_right']
+        fb = room['floor_bottom']
+
+        painter.fillRect(QRectF(bl, bt, br - bl, bb - bt), wall_fill)
+
+        floor = QPainterPath()
+        floor.moveTo(bl, bb)
+        floor.lineTo(br, bb)
+        floor.lineTo(fr, fb)
+        floor.lineTo(fl, fb)
+        floor.closeSubpath()
+        painter.fillPath(floor, floor_fill)
+
+        for i in range(11):
+            x = bl + (br - bl) * i / 10
+            painter.setPen(QPen(major if i % 5 == 0 else minor, 1))
+            painter.drawLine(QPointF(x, bt), QPointF(x, bb))
+        for i in range(7):
+            y = bt + (bb - bt) * i / 6
+            painter.setPen(QPen(major if i % 3 == 0 else minor, 1))
+            painter.drawLine(QPointF(bl, y), QPointF(br, y))
+
+        for i in range(13):
+            t = i / 12
+            x_back = bl + (br - bl) * t
+            x_front = fl + (fr - fl) * t
+            painter.setPen(QPen(major if i % 3 == 0 else minor, 1))
+            painter.drawLine(QPointF(x_back, bb), QPointF(x_front, fb))
+
+        for i in range(9):
+            t = i / 8
+            depth = t
+            left, right = self._floor_bounds_at_depth(depth)
+            y = self._ground_y_at_depth(depth)
+            painter.setPen(QPen(major if i % 2 == 0 else minor, 1))
+            painter.drawLine(QPointF(left, y), QPointF(right, y))
+
+    def _display_players(self):
+        values = list(self.players.values())
+        local = dict(self._local)
+        local['display_x'] = local['x']
+        local['display_depth'] = local['depth']
+        values.append(local)
+        return values
+
+    def _current_frame(self, player):
+        asset = self._asset(player.get('operator'))
+        if asset is None:
+            return None, None
+        mode = (
+            'move'
+            if player.get('display_animation', player.get('animation')) == 'move'
+            else 'relax'
+        )
+        movie = asset['movies'].get(mode) or asset['movies'].get('relax')
+        if movie is None:
+            return None, None
+        return movie.currentPixmap(), asset.get('source_rect')
+
+    def _draw_bubble(self, painter, player, text):
+        text = str(text or '')
+        if not text:
+            return
+        dest = self._destination(player)
+        if dest.isNull():
+            return
+
+        font = painter.font()
+        font.setPointSizeF(max(9.2, min(12.8, dest.height() * 0.10)))
+        painter.save()
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        max_width = min(max(180, int(self.width() * 0.22)), 320)
+        text_rect = fm.boundingRect(
+            QRect(0, 0, max_width, 600),
+            Qt.TextWordWrap,
+            text,
+        )
+        bubble = QRectF(
+            dest.center().x() - text_rect.width() / 2.0 - 14,
+            max(8.0, dest.top() - text_rect.height() - 40),
+            text_rect.width() + 28,
+            text_rect.height() + 20,
+        )
+        if bubble.left() < 8:
+            bubble.moveLeft(8)
+        if bubble.right() > self.width() - 8:
+            bubble.moveRight(self.width() - 8)
+
+        fill = QColor(236,239,244,205)
+        border = QColor(160,168,178,212)
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(bubble, 11, 11)
+        painter.setPen(QColor(44,49,58,242))
+        painter.drawText(
+            bubble.adjusted(14,10,-14,-10),
+            Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
+            text,
+        )
+        painter.restore()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self._draw_grid(painter)
+
+        players = sorted(
+            self._display_players(),
+            key=lambda p: p.get('display_depth', p.get('depth', 0.5)),
+        )
+        for player in players:
+            frame, source = self._current_frame(player)
+            if frame is None or frame.isNull() or source is None:
+                continue
+            dest = self._destination(player)
+            painter.save()
+            if int(player.get('facing', 1)) < 0:
+                painter.translate(dest.center().x() * 2, 0)
+                painter.scale(-1, 1)
+            painter.drawPixmap(dest, frame, QRectF(source))
+            painter.restore()
+
+            # Username is the online identity; operator name is intentionally omitted.
+            painter.save()
+            painter.setPen(QColor('#596b83' if ACTIVE_THEME == 'day' else '#d7dde8'))
+            painter.drawText(
+                QRectF(dest.left() - 30, dest.bottom() + 3, dest.width() + 60, 22),
+                Qt.AlignHCenter | Qt.AlignTop,
+                str(player.get('username', '')),
+            )
+            painter.restore()
+
+        now = time.monotonic()
+        for player_id in list(self._chat_bubbles):
+            bubble = self._chat_bubbles[player_id]
+            if now >= bubble.get('expires_at', 0.0):
+                self._chat_bubbles.pop(player_id, None)
+                continue
+            if player_id == self.local_player_id:
+                player = self._local
+            else:
+                player = self.players.get(player_id)
+            if player is not None:
+                self._draw_bubble(painter, player, bubble.get('text', ''))
+
+        painter.setPen(QColor('#596b83' if ACTIVE_THEME == 'day' else '#aab6c7'))
+        painter.drawText(
+            self.rect().adjusted(15, 10, -15, -10),
+            Qt.AlignLeft | Qt.AlignTop,
+            self.status,
+        )
+
+    def _tick(self):
+        dt = self._clock.interval() / 1000.0
+
+        moving = bool(self._keys & {Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D})
+        speed = 0.115
+        depth_speed = speed * 0.88
+        if Qt.Key_A in self._keys:
+            self._local['x'] -= speed * dt
+            self._local['facing'] = -1
+        if Qt.Key_D in self._keys:
+            self._local['x'] += speed * dt
+            self._local['facing'] = 1
+        if Qt.Key_W in self._keys:
+            self._local['depth'] -= depth_speed * dt
+        if Qt.Key_S in self._keys:
+            self._local['depth'] += depth_speed * dt
+
+        self._local['x'] = max(0.07, min(0.93, self._local['x']))
+        self._local['depth'] = max(0.10, min(0.93, self._local['depth']))
+        self._local['animation'] = 'move' if moving else 'relax'
+        self._local['display_animation'] = self._local['animation']
+
+        # Smooth remote players toward the latest network snapshot.
+        # Interpolation is still visual movement, so keep the move GIF playing
+        # until the remote avatar has actually reached the server target.
+        alpha = min(1.0, dt * 9.0)
+        for player in self.players.values():
+            dx = player['x'] - player['display_x']
+            dd = player['depth'] - player['display_depth']
+            visual_distance = math.hypot(dx, dd)
+
+            player['display_x'] += dx * alpha
+            player['display_depth'] += dd * alpha
+
+            still_interpolating = visual_distance > 0.0025
+            network_moving = player.get('animation') == 'move'
+            player['display_animation'] = (
+                'move' if (network_moving or still_interpolating) else 'relax'
+            )
+
+        # Send ~12.5Hz, not every 60FPS paint/update frame.
+        self._state_send_accum += dt
+        state = (
+            round(self._local['x'], 4),
+            round(self._local['depth'], 4),
+            self._local['facing'],
+            self._local['animation'],
+        )
+        if self.local_player_id and self._state_send_accum >= 0.08:
+            self._state_send_accum = 0.0
+            if state != self._last_sent_state:
+                self.client.send({
+                    'type': 'state',
+                    'data': {
+                        'x': self._local['x'],
+                        'depth': self._local['depth'],
+                        'facing': self._local['facing'],
+                        'animation': self._local['animation'],
+                    }
+                })
+                self._last_sent_state = state
+
+        if self._speech_editor.isVisible():
+            self._position_editor()
+        self.update()
+
+    def _open_editor(self):
+        self._keys.clear()
+        self._speech_editor.clear()
+        self._speech_editor.show()
+        self._resize_editor()
+        self._position_editor()
+        self._speech_editor.raise_()
+        self._speech_editor.setFocus(Qt.ShortcutFocusReason)
+
+    def _send_editor(self):
+        # Preserve the user's actual typed text. Only leading/trailing whitespace
+        # is removed; internal spaces and manual newlines are retained.
+        message = self._speech_editor.toPlainText().strip()
+        self._speech_editor.hide()
+        self._speech_editor.clear()
+        self.setFocus(Qt.ShortcutFocusReason)
+        if not message:
+            return
+
+        self._local_chat_sequence += 1
+        message_id = (
+            f"{self.local_player_id or 'offline'}:"
+            f"{int(time.time() * 1000)}:{self._local_chat_sequence}"
+        )
+
+        # Optimistic local rendering: the sender sees the message immediately,
+        # rather than waiting for a network round trip.
+        local_id = self.local_player_id or '__local__'
+        self._seen_chat_ids.add(message_id)
+        self._chat_history.append({
+            'username': self.nickname,
+            'message': message,
+            'message_id': message_id,
+        })
+        self._chat_history = self._chat_history[-600:]
+        self._chat_bubbles[local_id] = {
+            'text': message,
+            'expires_at': time.monotonic() + 2.35,
+        }
+
+        if self.local_player_id:
+            self.client.send({
+                'type': 'chat',
+                'data': {
+                    'message': message,
+                    'message_id': message_id,
+                }
+            })
+        self.update()
+
+    def _resize_editor(self):
+        if not self._speech_editor.isVisible():
+            return
+        fm = QFontMetrics(self._speech_editor.font())
+        longest = max(self._speech_editor.toPlainText().splitlines() or [''], key=len)
+        width = max(190, min(390, fm.horizontalAdvance(longest) + 46))
+        document = self._speech_editor.document()
+        document.setTextWidth(max(120, width - 28))
+        height = max(48, min(230, int(document.size().height()) + 28))
+        self._speech_editor.resize(width, height)
+        self._position_editor()
+
+    def _position_editor(self):
+        if not self._speech_editor.isVisible():
+            return
+        dest = self._destination(self._local)
+        if dest.isNull():
+            return
+        w, h = self._speech_editor.width(), self._speech_editor.height()
+        x = max(8, min(self.width() - w - 8, int(dest.center().x() - w / 2)))
+        y = max(8, min(self.height() - h - 8, int(dest.top() - h - 18)))
+        self._speech_editor.move(x, y)
+        self._speech_editor.raise_()
+
+    def _show_chat_history(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(TXT('聊天记录', 'Chat History'))
+        dialog.resize(660, 560)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(18,16,18,16)
+        title = QLabel(TXT('聊天记录', 'Chat History'))
+        title.setStyleSheet('font-size:22px; font-weight:700;')
+        outer.addWidget(title)
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        feed = QVBoxLayout(host)
+        feed.setContentsMargins(4,4,8,4)
+        feed.setSpacing(10)
+
+        if not self._chat_history:
+            empty = QLabel(TXT('还没有消息。', 'No messages yet.'))
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet('color:#8b939f; padding:30px;')
+            feed.addWidget(empty)
+        else:
+            for entry in self._chat_history:
+                card = QFrame()
+                card.setStyleSheet(
+                    'QFrame { background:rgba(128,136,148,22);'
+                    ' border:1px solid rgba(128,136,148,48);'
+                    ' border-radius:12px; }'
+                )
+                box = QVBoxLayout(card)
+                box.setContentsMargins(13,10,13,11)
+                user = QLabel(f"<b>{entry.get('username','')}</b>")
+                user.setTextFormat(Qt.RichText)
+                box.addWidget(user)
+                message = QLabel(entry.get('message',''))
+                message.setWordWrap(True)
+                message.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                box.addWidget(message)
+                feed.addWidget(card)
+
+        feed.addStretch()
+        scroll.setWidget(host)
+        outer.addWidget(scroll, 1)
+        close = FloatingButton(TXT('关闭', 'Close'))
+        close.clicked.connect(dialog.accept)
+        outer.addWidget(close, 0, Qt.AlignRight)
+        dialog.exec()
+
+    def eventFilter(self, watched, event):
+        if watched is self._speech_editor and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
+                self._show_chat_history()
+                event.accept()
+                return True
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if event.modifiers() & Qt.ShiftModifier:
+                    return False
+                self._send_editor()
+                event.accept()
+                return True
+            if event.key() == Qt.Key_Escape:
+                self._speech_editor.hide()
+                self._speech_editor.clear()
+                self.setFocus(Qt.ShortcutFocusReason)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
+            self._keys.clear()
+            self._show_chat_history()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._open_editor()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            self._keys.add(event.key())
+            event.accept()
+            return
+        # R intentionally does nothing here: the online avatar is never released.
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        self._keys.discard(event.key())
+        if event.key() in (Qt.Key_W, Qt.Key_A, Qt.Key_S, Qt.Key_D):
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+
+class MultiplayerRoomPage(QWidget):
+    backRequested = Signal()
+
+    def __init__(self, actor_assets, operator_id, nickname, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28,20,28,24)
+
+        header = QHBoxLayout()
+        back = FloatingButton(TXT('← 返回游乐场', '← Back to Playground'))
+        back.clicked.connect(self.backRequested)
+        header.addWidget(back)
+
+        title = QLabel(TXT('联机房间', 'Multiplayer Room'))
+        title.setStyleSheet('font-size:24px; font-weight:700;')
+        header.addWidget(title)
+        header.addStretch()
+
+        identity = QLabel(TXT(
+            f'当前昵称：{nickname}',
+            f'Nickname: {nickname}'
+        ))
+        identity.setStyleSheet('color:#8b939f;')
+        header.addWidget(identity)
+        outer.addLayout(header)
+
+        hint = QLabel(TXT(
+            'WASD 移动 · Enter 输入/发送 · Ctrl+S 聊天记录 · 本房间无法释放角色',
+            'WASD move · Enter type/send · Ctrl+S chat history · avatar control cannot be released'
+        ))
+        hint.setStyleSheet('color:#8b939f;')
+        outer.addWidget(hint)
+
+        self.canvas = MultiplayerCanvas(
+            actor_assets,
+            operator_id,
+            nickname,
+            self,
+        )
+        outer.addWidget(self.canvas, 1)
+
+    def close_room(self):
+        self.canvas.close_room()
+
+
 
 class MusicPage(QWidget):
     def __init__(self, parent=None):
@@ -4086,6 +4814,9 @@ class MusicPage(QWidget):
         self.home_playground_button.setText(TXT('进入游乐场  ↗', 'Enter Playground  ↗'))
         if hasattr(self, 'playground_page'):
             self.playground_page.back_btn.setText(TXT('← 返回主页', '← Back Home'))
+            self.playground_page.multiplayer_btn.setText(
+                TXT('联机房间', 'Multiplayer Room')
+            )
         self.home_guide.setText(TXT('打开使用指南', 'Open User Guide'))
         self._refresh_daily_song()
         for label, zh, en in self._localized_labels:
@@ -4789,7 +5520,98 @@ class MusicPage(QWidget):
         self.playground_page = PlaygroundPage(self)
         self.playground_page.backRequested.connect(lambda: self.main_stack.setCurrentIndex(2))
         self.playground_page.themeRequested.connect(self._playground_theme_requested)
+        self.playground_page.multiplayerRequested.connect(self._open_multiplayer_join)
         return self.playground_page
+
+    def _open_multiplayer_join(self):
+        actors = list(getattr(self.playground_page.canvas, '_actors', []))
+        if not actors:
+            QMessageBox.warning(
+                self,
+                TXT('联机房间', 'Multiplayer Room'),
+                TXT('没有可用的干员动画包。', 'No operator animation packs are available.')
+            )
+            return
+
+        chooser = QDialog(self)
+        chooser.setWindowTitle(TXT('选择干员', 'Choose Operator'))
+        chooser.resize(430, 500)
+        outer = QVBoxLayout(chooser)
+        title = QLabel(TXT('选择进入房间的干员', 'Choose your operator'))
+        title.setStyleSheet('font-size:21px; font-weight:700;')
+        outer.addWidget(title)
+
+        note = QLabel(TXT(
+            '联机房间只有真实用户控制的角色，没有 AI。',
+            'The multiplayer room contains only human-controlled avatars; there is no AI.'
+        ))
+        note.setWordWrap(True)
+        note.setStyleSheet('color:#8b939f;')
+        outer.addWidget(note)
+
+        list_widget = QListWidget()
+        for actor in actors:
+            item = QListWidgetItem(
+                str(actor.get('display_name') or actor.get('id'))
+            )
+            item.setData(Qt.UserRole, actor.get('id'))
+            list_widget.addItem(item)
+        if list_widget.count():
+            list_widget.setCurrentRow(0)
+        outer.addWidget(list_widget, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        cancel = FloatingButton(TXT('取消', 'Cancel'))
+        ok = FloatingButton(TXT('下一步', 'Next'))
+        cancel.clicked.connect(chooser.reject)
+        ok.clicked.connect(chooser.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(ok)
+        outer.addLayout(actions)
+
+        if chooser.exec() != QDialog.Accepted or list_widget.currentItem() is None:
+            return
+        operator_id = str(list_widget.currentItem().data(Qt.UserRole))
+
+        nickname, accepted = QInputDialog.getText(
+            self,
+            TXT('房间昵称', 'Room Nickname'),
+            TXT('你想在这个房间里叫什么？', 'What should others call you in this room?')
+        )
+        nickname = str(nickname).strip()[:24]
+        if not accepted or not nickname:
+            return
+
+        if hasattr(self, 'multiplayer_page') and self.multiplayer_page is not None:
+            try:
+                self.multiplayer_page.close_room()
+                self.main_stack.removeWidget(self.multiplayer_page)
+                self.multiplayer_page.deleteLater()
+            except RuntimeError:
+                pass
+
+        self.multiplayer_page = MultiplayerRoomPage(
+            actors,
+            operator_id,
+            nickname,
+            self,
+        )
+        self.multiplayer_page.backRequested.connect(self._leave_multiplayer_room)
+        self.main_stack.addWidget(self.multiplayer_page)
+        self.main_stack.setCurrentWidget(self.multiplayer_page)
+        self.multiplayer_page.canvas.setFocus(Qt.OtherFocusReason)
+
+    def _leave_multiplayer_room(self):
+        page = getattr(self, 'multiplayer_page', None)
+        if page is None:
+            self.main_stack.setCurrentWidget(self.playground_page)
+            return
+        page.close_room()
+        self.main_stack.setCurrentWidget(self.playground_page)
+        self.main_stack.removeWidget(page)
+        page.deleteLater()
+        self.multiplayer_page = None
 
     def _playground_theme_requested(self, theme):
         if theme not in ('day', 'night'):
