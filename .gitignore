@@ -1,0 +1,64 @@
+
+# ==============================
+# Python compiled files and cache
+# ==============================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# ==============================
+# General cache directories
+# ==============================
+cache/
+caches/
+.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# ==============================
+# Velia runtime caches
+# ==============================
+artwork_cache/
+audio_cache/
+music_cache/
+playground_actors/
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+logs/
+*.bak
+*.swp
+*~
+
+# ==============================
+# Python environments
+# ==============================
+.venv/
+venv/
+env/
+.env
+
+# ==============================
+# IDE and operating system files
+# ==============================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Build output
+# ==============================
+build/
+dist/
+*.egg-info/
