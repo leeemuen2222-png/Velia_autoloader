@@ -95,18 +95,18 @@ class RoomView(QWidget):
         return steps.get((row, col), 0.0)
 
     def _tile_white_level(self, row, col):
-        """Keep tiles white; only introduce tiny variations for realism."""
+        """Keep tiles visually white with only tiny surface variation."""
         seed = (row * 13 + col * 17 + row * col) % 5
-        return 245 + (seed - 2)
+        return 246 + (seed - 2)
 
-    def _draw_tile(self, painter, row, col, grid, pixels_per_m):
+    def _draw_tile(self, painter, row, col, grid, vertical_px_per_m):
         base_tl = grid[row][col]
         base_tr = grid[row][col + 1]
         base_bl = grid[row + 1][col]
         base_br = grid[row + 1][col + 1]
 
         h_m = self._tile_height_m(row, col)
-        lift_px = pixels_per_m * h_m
+        lift_px = vertical_px_per_m * h_m
         top_tl = self._shift_up(base_tl, lift_px)
         top_tr = self._shift_up(base_tr, lift_px)
         top_bl = self._shift_up(base_bl, lift_px)
@@ -118,14 +118,14 @@ class RoomView(QWidget):
 
         # Exposed front face.
         if h_m > front_neighbor:
-            lower_l = self._shift_up(base_bl, pixels_per_m * front_neighbor)
-            lower_r = self._shift_up(base_br, pixels_per_m * front_neighbor)
+            lower_l = self._shift_up(base_bl, vertical_px_per_m * front_neighbor)
+            lower_r = self._shift_up(base_br, vertical_px_per_m * front_neighbor)
             face = QPolygonF([top_bl, top_br, lower_r, lower_l])
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(224, 226, 230, 230) if self.theme != 'dark'
-                             else QColor(198, 201, 207, 220))
+            painter.setBrush(QColor(226, 228, 232, 255) if self.theme != 'dark'
+                             else QColor(198, 201, 207, 255))
             painter.drawPolygon(face)
-            face_pen = QPen(QColor(0, 0, 0, 70 if self.theme == 'dark' else 80), 1.0)
+            face_pen = QPen(QColor(0, 0, 0, 78 if self.theme != 'dark' else 70), 1.0)
             face_pen.setCosmetic(True)
             painter.setPen(face_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -133,20 +133,20 @@ class RoomView(QWidget):
 
         # Exposed side faces.
         if h_m > left_neighbor:
-            lower_t = self._shift_up(base_tl, pixels_per_m * left_neighbor)
-            lower_b = self._shift_up(base_bl, pixels_per_m * left_neighbor)
+            lower_t = self._shift_up(base_tl, vertical_px_per_m * left_neighbor)
+            lower_b = self._shift_up(base_bl, vertical_px_per_m * left_neighbor)
             face = QPolygonF([top_tl, top_bl, lower_b, lower_t])
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(230, 232, 236, 210) if self.theme != 'dark'
-                             else QColor(202, 205, 211, 205))
+            painter.setBrush(QColor(232, 234, 238, 255) if self.theme != 'dark'
+                             else QColor(202, 205, 211, 255))
             painter.drawPolygon(face)
         if h_m > right_neighbor:
-            lower_t = self._shift_up(base_tr, pixels_per_m * right_neighbor)
-            lower_b = self._shift_up(base_br, pixels_per_m * right_neighbor)
+            lower_t = self._shift_up(base_tr, vertical_px_per_m * right_neighbor)
+            lower_b = self._shift_up(base_br, vertical_px_per_m * right_neighbor)
             face = QPolygonF([top_tr, top_br, lower_b, lower_t])
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(218, 220, 224, 205) if self.theme != 'dark'
-                             else QColor(194, 197, 203, 198))
+            painter.setBrush(QColor(220, 222, 226, 255) if self.theme != 'dark'
+                             else QColor(194, 197, 203, 255))
             painter.drawPolygon(face)
 
         # Top white slab.
@@ -156,28 +156,29 @@ class RoomView(QWidget):
         painter.setBrush(QColor(white, white, white, 255))
         painter.drawPolygon(top_poly)
 
-        # Slight internal tone only; keep tiles visually white.
+        # Very soft local tone only; do not darken overall tile color.
         soft_shadow = QPolygonF([
             top_tl,
-            QPointF((top_tl.x() + top_tr.x()) * 0.52, (top_tl.y() + top_tr.y()) * 0.52 + top_bl.y() * 0.48),
-            QPointF((top_tl.x() + top_bl.x()) * 0.50, (top_tl.y() + top_bl.y()) * 0.50),
+            QPointF((top_tl.x() + top_tr.x()) * 0.52,
+                    (top_tl.y() + top_tr.y()) * 0.52 + top_bl.y() * 0.48),
+            QPointF((top_tl.x() + top_bl.x()) * 0.50,
+                    (top_tl.y() + top_bl.y()) * 0.50),
         ])
         painter.setBrush(QColor(0, 0, 0, 7 if self.theme != 'dark' else 10))
         painter.drawPolygon(soft_shadow)
 
-        # Seams: slightly larger and darker than before, while staying subtle.
-        groove = QPen(QColor(122, 128, 138, 185) if self.theme != 'dark'
-                      else QColor(85, 92, 103, 205), 1.5)
-        groove.setCosmetic(True)
-        groove.setStyle(Qt.PenStyle.SolidLine)
-        painter.setPen(groove)
+        # Seams: slightly larger and darker while keeping the tile itself white.
+        joint_shadow = QPen(QColor(0, 0, 0, 28 if self.theme != 'dark' else 40), 2.3)
+        joint_shadow.setCosmetic(True)
+        painter.setPen(joint_shadow)
         painter.drawLine(top_tr, top_br)
         painter.drawLine(top_bl, top_br)
 
-        # Contact shadow right beside the joint.
-        joint_shadow = QPen(QColor(0, 0, 0, 26 if self.theme != 'dark' else 40), 2.2)
-        joint_shadow.setCosmetic(True)
-        painter.setPen(joint_shadow)
+        groove = QPen(QColor(122, 128, 138, 190) if self.theme != 'dark'
+                      else QColor(85, 92, 103, 205), 1.55)
+        groove.setCosmetic(True)
+        groove.setStyle(Qt.PenStyle.SolidLine)
+        painter.setPen(groove)
         painter.drawLine(top_tr, top_br)
         painter.drawLine(top_bl, top_br)
 
@@ -188,7 +189,7 @@ class RoomView(QWidget):
         painter.drawLine(top_tl, top_tr)
         painter.drawLine(top_tl, top_bl)
 
-        outline = QPen(QColor(95, 101, 110, 130) if self.theme != 'dark'
+        outline = QPen(QColor(95, 101, 110, 132) if self.theme != 'dark'
                        else QColor(130, 136, 147, 120), 1.0)
         outline.setCosmetic(True)
         painter.setPen(outline)
@@ -231,7 +232,11 @@ class RoomView(QWidget):
         right_wall = [wall_tr, outer_right_top, front_right, back_right]
         back_wall = [wall_tl, wall_tr, back_right, back_left]
         floor_poly = QPolygonF([back_left, back_right, front_right, front_left])
+        room_inner_poly = QPolygonF([
+            outer_left_top, wall_tl, wall_tr, outer_right_top, front_right, front_left
+        ])
 
+        # Wall base fills.
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(22, 27, 36, 38) if self.theme == 'dark' else QColor(15, 20, 30, 20))
         painter.drawPolygon(QPolygonF(left_wall))
@@ -239,6 +244,7 @@ class RoomView(QWidget):
         painter.setBrush(QColor(255, 255, 255, 13) if self.theme == 'dark' else QColor(255, 255, 255, 37))
         painter.drawPolygon(QPolygonF(back_wall))
 
+        # Build floor grid points.
         left_edge = [self._interpolate(back_left, front_left, self._depth_fraction(i))
                      for i in range(ROOM_SIDE_M + 1)]
         right_edge = [self._interpolate(back_right, front_right, self._depth_fraction(i))
@@ -250,24 +256,15 @@ class RoomView(QWidget):
                 for col in range(ROOM_SIDE_M + 1)
             ])
 
-        pixels_per_m = max(2.0, abs(floor_grid[2][0].y() - floor_grid[1][0].y()))
+        # One vertical metre = one wall-metre on screen.
+        vertical_px_per_m = (back_y - upper_y) / ROOM_WALL_HEIGHT_M
 
-        # Hard clip all tile drawing to the room footprint so no shadow spills below the room.
-        painter.save()
-        clip_path = QPainterPath()
-        clip_path.addPolygon(floor_poly)
-        painter.setClipPath(clip_path)
-        for row in range(ROOM_SIDE_M):
-            for col in range(ROOM_SIDE_M):
-                self._draw_tile(painter, row, col, floor_grid, pixels_per_m)
-        painter.restore()
-
+        # Draw wall grids first so raised tiles appear in front of the wall instead of being blocked by it.
         wall_pen = QPen(QColor(0, 0, 0, 118), 1.05)
         wall_pen.setCosmetic(True)
         wall_pen.setStyle(Qt.PenStyle.SolidLine)
         painter.setPen(wall_pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-
         for i in range(ROOM_SIDE_M + 1):
             t = i / ROOM_SIDE_M
             painter.drawLine(self._interpolate(wall_tl, wall_tr, t),
@@ -287,13 +284,25 @@ class RoomView(QWidget):
                 painter.drawLine(self._interpolate(top_front, bottom_front, t),
                                  self._interpolate(top_back, bottom_back, t))
 
+        # Clip tile drawing to the room interior, not only the floor plane.
+        painter.save()
+        clip_path = QPainterPath()
+        clip_path.addPolygon(room_inner_poly)
+        painter.setClipPath(clip_path)
+        for row in range(ROOM_SIDE_M):
+            for col in range(ROOM_SIDE_M):
+                self._draw_tile(painter, row, col, floor_grid, vertical_px_per_m)
+        painter.restore()
+
+        # Final room outlines over everything.
         edge_pen = QPen(QColor(0, 0, 0, 138), 1.2)
         edge_pen.setCosmetic(True)
         painter.setPen(edge_pen)
+        painter.drawLine(wall_tl, wall_tr)
         painter.drawLine(wall_tl, back_left)
         painter.drawLine(wall_tr, back_right)
         painter.drawLine(back_left, front_left)
         painter.drawLine(back_right, front_right)
-        painter.drawLine(wall_tl, wall_tr)
         painter.drawLine(front_left, front_right)
+        # Keep the floor/back seam subtle and behind raised tiles; do not redraw the full back seam.
         painter.end()
