@@ -3,12 +3,13 @@ import json
 import os
 import sys
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint
+from PySide6.QtGui import QFont, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
-    QComboBox, QSizePolicy)
+    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
+from room_view import RoomView, wallpapers, ROOM_SIDE_M
 
 ROOT = Path(__file__).resolve().parent
 PREF = ROOT / "local" / "preferences" / "playground_settings.json"
@@ -47,6 +48,99 @@ class AnimatedButton(QPushButton):
         self._anim.setStartValue(self.height())
         self._anim.setEndValue(height)
         self._anim.start()
+
+class RoundedComboBox(QComboBox):
+    # Frameless popup avoids native Windows combo borders.
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup = None
+        self._dark = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(44)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # Draw our own theme-aware chevron. Native Qt arrows can create
+        # unexpected black squares on Windows with custom combo popups.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor('#f3f5f7' if self._dark else '#17202b'), 1.8))
+        x = self.width() - 21
+        y = self.height() // 2
+        is_open = self._popup is not None and self._popup.isVisible()
+        if is_open:  # downward chevron (v)
+            painter.drawLine(x - 5, y - 3, x, y + 2)
+            painter.drawLine(x, y + 2, x + 5, y - 3)
+        else:  # right-pointing chevron (>)
+            painter.drawLine(x - 2, y - 5, x + 3, y)
+            painter.drawLine(x + 3, y, x - 2, y + 5)
+        painter.end()
+
+    def set_dark(self, dark):
+        self._dark = bool(dark)
+        if self._popup is not None:
+            self._popup.close()
+            self._popup = None
+
+    def showPopup(self):
+        if self.count() == 0:
+            return
+        if self._popup is not None:
+            self._popup.close()
+        popup = QFrame(None, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        popup.setObjectName('veliaPopupShell')
+        outer = QVBoxLayout(popup)
+        outer.setContentsMargins(3, 3, 3, 3)
+        outer.setSpacing(0)
+        body = QFrame(popup)
+        body.setObjectName('veliaPopupBody')
+        outer.addWidget(body)
+        b_layout = QVBoxLayout(body)
+        b_layout.setContentsMargins(5, 5, 5, 5)
+        b_layout.setSpacing(3)
+        surface = '#1b1e24' if self._dark else '#ffffff'
+        border = '#444a55' if self._dark else '#c9d1db'
+        text_color = '#f3f5f7' if self._dark else '#17202b'
+        hovered = '#323842' if self._dark else '#edf1f6'
+        chosen = '#404854' if self._dark else '#dbe5f0'
+        body.setStyleSheet(f'QFrame#veliaPopupBody {{background:{surface};border:1px solid {border};border-radius:13px;}}')
+        scroll = QScrollArea(body)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet('QScrollArea {border:0;background:transparent;} QScrollArea > QWidget > QWidget {background:transparent;}')
+        rows = QWidget()
+        rows.setStyleSheet('background:transparent;')
+        row_layout = QVBoxLayout(rows)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(2)
+        for i in range(self.count()):
+            button = QPushButton(self.itemText(i), rows)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(37)
+            button.setEnabled(self.model().item(i).isEnabled() if hasattr(self.model(), 'item') and self.model().item(i) is not None else True)
+            button.setStyleSheet(f'''QPushButton {{text-align:left;padding:7px 12px;color:{text_color};background:{chosen if i == self.currentIndex() else surface};border:none;border-radius:8px;font-weight:500;}}
+                QPushButton:hover {{background:{hovered};}}
+                QPushButton:pressed {{background:{chosen};padding-top:9px;padding-bottom:5px;}}''')
+            button.clicked.connect(lambda checked=False, index=i, menu=popup: (self.setCurrentIndex(index), menu.close(), self.update()))
+            row_layout.addWidget(button)
+        scroll.setWidget(rows)
+        b_layout.addWidget(scroll)
+        width = max(self.width(), 230)
+        height = min(self.count() * 39 + 20, 320)
+        popup.resize(width, height)
+        pos = self.mapToGlobal(QPoint(0, self.height() + 3))
+        screen = self.screen().availableGeometry()
+        if pos.x() + width > screen.right():
+            pos.setX(screen.right() - width)
+        if pos.y() + height > screen.bottom():
+            pos.setY(self.mapToGlobal(QPoint(0, -height - 3)).y())
+        popup.move(pos)
+        self._popup = popup
+        popup.destroyed.connect(lambda: setattr(self, '_popup', None) if self._popup is popup else None)
+        popup.show()
+        self.update()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -112,7 +206,7 @@ class MainWindow(QMainWindow):
         self.playground_desc = QLabel()
         self.playground_desc.setObjectName("muted")
         cl.addWidget(self.playground_desc)
-        self.enter_btn = self._button(action=lambda: self.stack.setCurrentWidget(self.playground),kind="primary")
+        self.enter_btn = self._button(action=self._enter_playground,kind="primary")
         cl.addWidget(self.enter_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         hl.addWidget(card)
         hl.addStretch()
@@ -127,18 +221,20 @@ class MainWindow(QMainWindow):
         self.stage_title.setObjectName("cardTitle")
         phead.addWidget(self.stage_title)
         phead.addStretch()
+        self.wallpaper_label = QLabel()
+        phead.addWidget(self.wallpaper_label)
+        self.wallpaper_combo = RoundedComboBox()
+        self.wallpaper_combo.setMinimumWidth(205)
+        self.wallpaper_combo.setMaximumWidth(340)
+        self.wallpaper_combo.currentIndexChanged.connect(self._wallpaper_changed)
+        phead.addWidget(self.wallpaper_combo)
         self.to_room = self._button(action=lambda: self.stack.setCurrentWidget(self.room))
         phead.addWidget(self.to_room)
         pl.addLayout(phead)
-        self.stage = QFrame()
+        self.stage = RoomView()
         self.stage.setObjectName("stage")
-        stage_layout = QVBoxLayout(self.stage)
-        stage_layout.setContentsMargins(20,20,20,20)
-        self.stage_note = QLabel()
-        self.stage_note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.stage_note.setObjectName("muted")
-        stage_layout.addWidget(self.stage_note)
-        pl.addWidget(self.stage,1)
+        pl.addWidget(self.stage, 1)
+        self._refresh_wallpapers()
         self.stack.addWidget(self.playground)
 
         self.room = QWidget()
@@ -200,7 +296,7 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.settings_title)
         self.theme_label = QLabel()
         sl.addWidget(self.theme_label)
-        self.theme_combo = QComboBox()
+        self.theme_combo = RoundedComboBox()
         self.theme_combo.addItem("", "light")
         self.theme_combo.addItem("", "dark")
         self.theme_combo.setCurrentIndex(0 if self.prefs["theme"] == "light" else 1)
@@ -208,7 +304,7 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.theme_combo)
         self.language_label = QLabel()
         sl.addWidget(self.language_label)
-        self.language_combo = QComboBox()
+        self.language_combo = RoundedComboBox()
         self.language_combo.addItem("简体中文", "zh")
         self.language_combo.addItem("English", "en")
         self.language_combo.setCurrentIndex(0 if self.prefs["language"] == "zh" else 1)
@@ -216,6 +312,25 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.language_combo)
         sl.addStretch()
         self.stack.addWidget(self.settings)
+
+    def _enter_playground(self):
+        self._refresh_wallpapers()
+        self.stack.setCurrentWidget(self.playground)
+
+    def _refresh_wallpapers(self):
+        current = self.wallpaper_combo.currentData()
+        self.wallpaper_combo.blockSignals(True)
+        self.wallpaper_combo.clear()
+        self.wallpaper_combo.addItem(self.tr2("默认初始房间", "Default room"), None)
+        for filename, label in wallpapers():
+            self.wallpaper_combo.addItem(label, filename)
+        index = self.wallpaper_combo.findData(current)
+        self.wallpaper_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.wallpaper_combo.blockSignals(False)
+        self._wallpaper_changed()
+
+    def _wallpaper_changed(self, *_):
+        self.stage.set_wallpaper(self.wallpaper_combo.currentData())
 
     def _connect_signals(self):
         self.client.connected.connect(self._connected)
@@ -235,9 +350,10 @@ class MainWindow(QMainWindow):
         self.playground_title.setText(t("游乐场", "Playground"))
         self.playground_desc.setText(t("角色、互动与场景系统已清空，等待重新设计。", "Character, interaction and scene systems cleared for redesign."))
         self.enter_btn.setText(t("进入游乐场 ↗", "Enter Playground ↗"))
-        self.stage_title.setText(t("游乐场 / 空白场景", "Playground / Empty Scene"))
+        self.stage_title.setText(t("游乐场 / 10 × 10 m", "Playground / 10 × 10 m"))
+        self.wallpaper_label.setText(t("房间壁纸", "Room wallpaper"))
+        self._refresh_wallpapers()
         self.to_room.setText(t("联机房间 ↗", "Multiplayer Room ↗"))
-        self.stage_note.setText(t("空白场景 · 等待新系统", "Empty scene · Ready for new systems"))
         self.room_title.setText(t("联机房间", "Multiplayer Room"))
         self.room_note.setText(t("仅保留连接与成员列表。已移除角色、动画和所有聊天功能。", "Connections and member lists only. All avatars, animations and chat removed."))
         self.url_label.setText(t("服务器地址", "Server URL"))
@@ -259,6 +375,9 @@ class MainWindow(QMainWindow):
         bg, panel, text, muted, border, button, hover, accent, active = (
             ("#f4f5f7","#ffffff","#131820","#637082","#d5dbe3","#ffffff","#edf0f4","#202831","#d7dfe9") if light else
             ("#101114","#1a1c21","#f4f5f7","#a6afbc","#393d45","#24272e","#363a43","#f0f2f5","#525864"))
+        for combo in (self.wallpaper_combo, self.theme_combo, self.language_combo):
+            combo.set_dark(not light)
+        self.stage.set_theme("light" if light else "dark")
         self.setStyleSheet(f"""
         QWidget#root {{background:{bg}; color:{text};font-family:'Segoe UI',Arial;font-size:14px;}}
         QLabel {{color:{text};}}
@@ -276,6 +395,10 @@ class MainWindow(QMainWindow):
         QPushButton[kind='primary']:pressed {{background:{active};color:{text};}}
         QLineEdit,QComboBox {{background:{panel};color:{text};border:1px solid {border};border-radius:10px;padding:12px;min-height:22px;}}
         QLineEdit:focus,QComboBox:focus {{border:1px solid {muted};}}
+        QComboBox::drop-down {{border:0px; width:29px; background:transparent;}}
+        QComboBox::down-arrow {{image:none;width:0px;height:0px;}}
+        QComboBox:hover {{background:{hover};border-color:{muted};}}
+        QComboBox:pressed {{background:{active};}}
         """)
 
     def _change_theme(self):
