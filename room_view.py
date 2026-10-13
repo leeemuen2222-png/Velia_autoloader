@@ -284,6 +284,18 @@ class RoomView(QWidget):
                 painter.drawLine(self._interpolate(top_front, bottom_front, t),
                                  self._interpolate(top_back, bottom_back, t))
 
+        # Every wall edge, including the corners and wall-to-floor seams, belongs
+        # BELOW the solid tiles. Do not redraw these over the floor later.
+        wall_edge = QPen(QColor(0, 0, 0, 138), 1.2)
+        wall_edge.setCosmetic(True)
+        painter.setPen(wall_edge)
+        painter.drawLine(wall_tl, wall_tr)
+        painter.drawLine(wall_tl, back_left)
+        painter.drawLine(wall_tr, back_right)
+        painter.drawLine(back_left, front_left)
+        painter.drawLine(back_right, front_right)
+        painter.drawLine(back_left, back_right)
+
         # Clip tile drawing to the room interior, not only the floor plane.
         painter.save()
         clip_path = QPainterPath()
@@ -294,15 +306,8 @@ class RoomView(QWidget):
                 self._draw_tile(painter, row, col, floor_grid, vertical_px_per_m)
         painter.restore()
 
-        # Final room outlines over everything.
-        edge_pen = QPen(QColor(0, 0, 0, 138), 1.2)
-        edge_pen.setCosmetic(True)
-        painter.setPen(edge_pen)
-        painter.drawLine(wall_tl, wall_tr)
-        painter.drawLine(wall_tl, back_left)
-        painter.drawLine(wall_tr, back_right)
-        painter.drawLine(back_left, front_left)
-        painter.drawLine(back_right, front_right)
+        # The front border is outside the raised back-corner blocks. It is safe
+        # to keep this one visible above the tiled floor.
+        painter.setPen(wall_edge)
         painter.drawLine(front_left, front_right)
-        # Keep the floor/back seam subtle and behind raised tiles; do not redraw the full back seam.
         painter.end()
