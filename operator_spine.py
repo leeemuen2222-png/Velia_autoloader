@@ -8,7 +8,7 @@ import json
 import random
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QLabel
 
@@ -70,6 +70,11 @@ class SpineRoomView(RoomView):
         self.overlay = None
         self.status = None
         self._ready = False
+        self._load_generation = 0
+        self._poll_count = 0
+        self._ready_poll = QTimer(self)
+        self._ready_poll.setInterval(150)
+        self._ready_poll.timeout.connect(self._poll_spine_readiness)
         self._request_setup()
 
     def _request_setup(self):
@@ -109,13 +114,18 @@ class SpineRoomView(RoomView):
         self.overlay.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.overlay.setMouseTracking(False)
+        # NEVER hide the WebEngine: hidden Chromium surfaces may not render,
+        # so Spine never reaches the first-frame readiness callback.
+        # Instead keep it alive completely outside the visible room until ready.
         self.overlay.loadFinished.connect(self._on_load)
-        self._ready = True
+        self.overlay.titleChanged.connect(self._on_spine_title)
         self._fit_overlay()
         # A local HTML document is constructed from the official Spine 3.8 player.
         html = (self._html_mov_only(mov, js, css) if perf is None
                 else self._html(perf, mov, js, css))
         self.overlay.setHtml(html, QUrl.fromLocalFile(str(ROOT) + '/'))
+        self.overlay.show()
+        self._ready_poll.start()
 
     def _warning(self, message):
         self.status = QLabel('Spine: ' + message, self)
@@ -125,8 +135,46 @@ class SpineRoomView(RoomView):
         self.status.show()
 
     def _on_load(self, ok):
+        # HTML loadFinished occurs BEFORE skeleton and texture readiness.
         if not ok:
-            self._warning('Spine renderer page failed to load')
+            self._load_failed('Spine HTML could not be loaded')
+        elif not self._ready:
+            self._ready_poll.start()
+
+    def _load_failed(self, message):
+        self._ready = False
+        self._ready_poll.stop()
+        # Keep the failed renderer outside the room; never show loading UI.
+        if self.overlay is not None:
+            self.overlay.setGeometry(-10000, -10000, 320, 320)
+        print('[Velia Spine] ' + str(message), flush=True)
+
+    def _poll_spine_readiness(self):
+        if self._ready or self.overlay is None:
+            self._ready_poll.stop()
+            return
+        self._poll_count += 1
+        # Qt may coalesce titleChanged events in an offscreen WebEngine.
+        # Read the page title as a fallback while the renderer stays alive.
+        try:
+            self.overlay.page().runJavaScript('document.title', self._on_spine_title)
+        except RuntimeError:
+            self._ready_poll.stop()
+        if self._poll_count >= 200:
+            self._load_failed('Timed out waiting for Spine/Relax readiness (30 seconds)')
+
+    def _on_spine_title(self, title):
+        if title == 'VELIA_SPINE_READY' and not self._ready:
+            # Deploy immediately once, keeping the selected random spawn.
+            self._ready = True
+            self._ready_poll.stop()
+            if self.overlay is not None:
+                self._fit_overlay()
+                self.overlay.show()
+                self.overlay.raise_()
+        elif title == 'VELIA_SPINE_ERROR' and not self._ready:
+            self._load_failed('Spine reported a skeleton / texture error')
+
 
     def _html_mov_only(self, mov_skel, js, css):
         # Enya exception: MOV only.
@@ -143,7 +191,8 @@ html,body{width:100%%;height:100%%;overflow:hidden;margin:0;background:transpare
 #mov{position:absolute;inset:0;background:transparent!important}
 .spine-player{height:100%%!important;background:transparent!important}
 .spine-player-canvas{background:transparent!important}
-.spine-player-controls,.spine-player-error{display:none!important}
+.spine-player-controls,.spine-player-error,.spine-player-loading,.spine-player-logo,
+.spine-player-progress,.spine-player-loading-screen{display:none!important}
 </style></head><body><div id="mov"></div><script src="%s"></script>
 <script>
 const files=%s;
@@ -168,12 +217,13 @@ new spine.SpinePlayer('mov',Object.assign({},params,{
   skelUrl:files.movSkel,atlasUrl:files.movAtlas,animation:'Relax',
   success:function(player){
     if(!player.skeleton.data.findAnimation('Relax')){
-      console.error('Missing MOV/Relax animation');return;
+      console.error('Missing MOV/Relax animation');document.title='VELIA_SPINE_ERROR';return;
     }
     player.animationState.setAnimation(0,'Relax',true);
     player.animationState.apply(player.skeleton);
     normalizeStage(player);
-  },error:function(p,msg){console.error('MOV/Relax',msg)}
+    setTimeout(()=>{document.title='VELIA_SPINE_READY';},120);
+  },error:function(p,msg){console.error('MOV/Relax',msg);document.title='VELIA_SPINE_ERROR';}
 }));
  </script></body></html>""" % (file_url(css), file_url(js), conf)
 
@@ -198,7 +248,8 @@ html,body{width:100%%;height:100%%;overflow:hidden;margin:0;background:transpare
 /* Both skeletons use an identical normalized visible stage and foot anchor.
    No CSS scale: it would also shift the foot when two assets have different bounds. */
 .spine-player-canvas{background:transparent!important}
-.spine-player-controls,.spine-player-error{display:none!important}
+.spine-player-controls,.spine-player-error,.spine-player-loading,.spine-player-logo,
+.spine-player-progress,.spine-player-loading-screen{display:none!important}
 </style></head><body><div id="perf"></div><div id="mov"></div>
 <script src="%s"></script><script>
 const files=%s;
@@ -247,12 +298,13 @@ function showRelax(){
 function readyPerf(player){
   perfPlayer=player;
   const clip=player.skeleton.data.findAnimation('Start');
-  if(!clip){console.error('Missing perf Start animation');return;}
+  if(!clip){console.error('Missing perf Start animation');document.title='VELIA_SPINE_ERROR';return;}
   // The bundled Spine player defaults to looping: explicitly play Start once.
   player.animationState.clearTracks();
   player.animationState.setAnimation(0,'Start',false);
   player.animationState.apply(player.skeleton);
   normalizeStage(player);
+  setTimeout(()=>{document.title='VELIA_SPINE_READY';},120);
   player.animationState.addListener({complete:function(entry){
     if(entry.animation && entry.animation.name==='Start'){
       startComplete=true;
@@ -272,12 +324,12 @@ function readyPerf(player){
       normalizeStage(relax);
       relaxReady=true;
       showRelax();
-    },error:function(p,msg){console.error('MOV/Relax',msg)}
+    },error:function(p,msg){console.error('MOV/Relax',msg);document.title='VELIA_SPINE_ERROR';}
   }));
 }
 new spine.SpinePlayer('perf',Object.assign({},params,{
   skelUrl:files.perfSkel,atlasUrl:files.perfAtlas,animation:'Start',
-  success:readyPerf,error:function(p,msg){console.error('PERF/Start',msg)}
+  success:readyPerf,error:function(p,msg){console.error('PERF/Start',msg);document.title='VELIA_SPINE_ERROR';}
 }));
 </script></body></html>''' % (css_url, lib_url, json.dumps(conf, ensure_ascii=False))
 
@@ -294,16 +346,30 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
         half = back_half + (front_half - back_half) * t
         cx = w / 2 + (self.spawn_x / ROOM_SIDE_M * 2 - 1) * half
         floor_y = h * (.48 + (.925 - .48) * t)
-        # A 1m vertical segment on each side wall scales between rear and front.
-        back_met = h * (.48 - .11) / 3
-        front_met = h * (.925 - .11) / 3
-        one_m = back_met + (front_met - back_met) * t
-        actor_h = OPERATOR_HEIGHT_M * one_m
+        # Visual character sizing is defined in screen space, then scaled with
+        # the room widget's height. At the 733px-high reference room these
+        # limits match the user's yellow (~150px) and red (~190px) boxes.
+        # The Spine viewport uses ~80% of the overlay for the visible figure,
+        # so account for that 0.80 occupancy rather than clipping the sprite.
+        reference_room_height = 733.0
+        visible_height_min = 150.0 / reference_room_height * h
+        visible_height_max = 190.0 / reference_room_height * h
+        viewport_occupancy = 0.80
+        depth_fraction = max(0.0, min(1.0, self.spawn_z / ROOM_SIDE_M))
+        visible_height = (visible_height_min +
+                          (visible_height_max - visible_height_min) * depth_fraction)
+        actor_h = visible_height / viewport_occupancy
         actor_w = actor_h * 1.60
-        # Height of embedded player viewport; Spine player fits skeleton inside.
+        target_w, target_h = max(1, round(actor_w)), max(1, round(actor_h))
+        if not self._ready:
+            # Keep WebEngine actively running, outside the clipped room.
+            # Its dimensions must already match the intended viewport so
+            # Spine can calculate skeleton bounds and render a first frame.
+            self.overlay.setGeometry(-10000, -10000, target_w, target_h)
+            return
         self.overlay.setGeometry(round(cx - actor_w / 2),
-                                 round(floor_y - actor_h),
-                                 max(1,round(actor_w)),max(1,round(actor_h)))
+                                 round(floor_y - actor_h * .94),
+                                 target_w, target_h)
         self.overlay.raise_()
 
     def resizeEvent(self, event):
@@ -315,4 +381,8 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
         self.spawn_x, self.spawn_z = sample_spawn()
         self._fit_overlay()
         if self.overlay is not None:
+            self._ready = False
+            self._poll_count = 0
+            self._fit_overlay()
+            self._ready_poll.start()
             self.overlay.reload()
