@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineE
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
     QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
-from room_view import RoomView, wallpapers, ROOM_SIDE_M
+from room_view import wallpapers, ROOM_SIDE_M
+from operator_spine import SpineRoomView
 
 ROOT = Path(__file__).resolve().parent
 PREF = ROOT / "local" / "preferences" / "playground_settings.json"
@@ -231,7 +232,7 @@ class MainWindow(QMainWindow):
         self.to_room = self._button(action=lambda: self.stack.setCurrentWidget(self.room))
         phead.addWidget(self.to_room)
         pl.addLayout(phead)
-        self.stage = RoomView()
+        self.stage = SpineRoomView()
         self.stage.setObjectName("stage")
         pl.addWidget(self.stage, 1)
         self._refresh_wallpapers()
@@ -316,6 +317,7 @@ class MainWindow(QMainWindow):
     def _enter_playground(self):
         self._refresh_wallpapers()
         self.stack.setCurrentWidget(self.playground)
+        self.stage.spawn_again()
 
     def _refresh_wallpapers(self):
         current = self.wallpaper_combo.currentData()
