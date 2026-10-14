@@ -62,3 +62,8 @@ desktop.ini
 build/
 dist/
 *.egg-info/
+
+# ==============================
+# Local user data and preferences
+# ==============================
+/local/
