@@ -252,6 +252,9 @@ class RoomConsole(QFrame):
                     '//oprelease — Release all operators from the room.\n'
                     '//listskin — List skins for the controlled operator.\n'
                     '//skinpick NUMBER — Switch the controlled operator to a skin.\n'
+                    '//perfmode [true|false] — Toggle PERF idle and lower-body MOV blend.\n'
+                    '//ani list — List MOV and PERF animation names.\n'
+                    '//ani display NAME [SPEED] [loop] — Play an animation.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
                 )
@@ -268,7 +271,7 @@ class RoomConsole(QFrame):
                 else:
                     skins = operator_skins(actor.operator_name)
                     self.log.appendPlainText('Available skins (' + actor.operator_name + '):\n' +
-                                             ('\n'.join(f'{idx}. {entry["label"]}' for idx, entry in skins.items())
+                                             ('\\n'.join(f'{idx}. {entry["label"]}' for idx, entry in skins.items())
                                               or '(none)'))
             elif content.startswith('skinpick'):
                 pieces = content.split()
@@ -281,6 +284,47 @@ class RoomConsole(QFrame):
                     self.log.appendPlainText(f'System: {actor.operator_name} skin {pieces[1]} selected.')
                 else:
                     self.log.appendPlainText('System: Skin unavailable or could not load.')
+            elif content == 'perfmode' or content.startswith('perfmode '):
+                actor = self.room.controlled_actor()
+                args = content.split()
+                if len(args) > 2 or (len(args) == 2 and args[1] not in ('true', 'false')):
+                    self.log.appendPlainText('System: Usage //perfmode [true|false]')
+                elif actor is None:
+                    self.log.appendPlainText('System: No controlled operator.')
+                else:
+                    target = (not actor._perf_mode) if len(args) == 1 else args[1] == 'true'
+                    actor.set_perf_mode(target, self.log.appendPlainText)
+            elif content == 'ani list':
+                actor = self.room.controlled_actor()
+                if actor is None:
+                    self.log.appendPlainText('System: No controlled operator.')
+                else:
+                    actor.list_animations(self.log.appendPlainText)
+            elif content.startswith('ani display'):
+                actor = self.room.controlled_actor()
+                args = content.split()
+                if actor is None:
+                    self.log.appendPlainText('System: No controlled operator.')
+                elif len(args) < 3 or len(args) > 5:
+                    self.log.appendPlainText('System: Usage //ani display NAME [SPEED] [loop]')
+                else:
+                    loop = args[-1] == 'loop'
+                    body = args[2:-1] if loop else args[2:]
+                    speed = 1.0
+                    if len(body) == 2:
+                        try:
+                            speed = float(body[-1])
+                        except ValueError:
+                            speed = -1
+                        name = body[0]
+                    elif len(body) == 1:
+                        name = body[0]
+                    else:
+                        name = ''
+                    if not name or not math.isfinite(speed) or speed <= 0:
+                        self.log.appendPlainText('System: Usage //ani display NAME [SPEED>0] [loop]')
+                    else:
+                        actor.display_animation(name, speed, loop, self.log.appendPlainText)
             elif content == 'oplist':
                 self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
             elif content == 'oprelease':
@@ -311,6 +355,7 @@ class SpineRoomView(RoomView):
         self.overlay = None
         self.status = None
         self._ready = False
+        self._deploying = False
         self._load_generation = 0
         self._poll_count = 0
         self._ready_poll = QTimer(self)
@@ -320,6 +365,7 @@ class SpineRoomView(RoomView):
         self._last_tick = time.monotonic()
         self._moving_animation = False
         self._sleeping = False
+        self._perf_mode = False
         self._facing_left = False
         self._velocity_x = 0.0
         self._velocity_z = 0.0
@@ -409,6 +455,9 @@ class SpineRoomView(RoomView):
         if name not in available:
             return False
         chosen = available[name]
+        for old in ([self] if self.operator_name else []) + list(self._actors.values()):
+            if old.operator_name != chosen and old._perf_mode:
+                old.set_perf_mode(False)
         self._control_name = chosen
         self._is_npc = chosen != self.operator_name
         self._held_keys.clear()
@@ -472,6 +521,7 @@ class SpineRoomView(RoomView):
         previous_overlay = self.overlay
         self._ready_poll.stop()
         self._ready = False
+        self._deploying = False
         self._poll_count = 0
         self._moving_animation = False
         self._last_depth_scale = None
@@ -483,6 +533,35 @@ class SpineRoomView(RoomView):
             previous_overlay.deleteLater()
         self._request_setup()
         return self.overlay is not None
+
+    def _js_command(self, expression, callback=None):
+        if not self.overlay or not self._ready or self._deploying:
+            if callback:
+                callback('System: Wait for deployment to finish.')
+            return
+        if callback:
+            def received(result):
+                try:
+                    callback(str(result) if result is not None else 'System: Spine response unavailable.')
+                except RuntimeError:
+                    pass
+            self.overlay.page().runJavaScript(expression, received)
+        else:
+            self.overlay.page().runJavaScript(expression)
+
+    def set_perf_mode(self, enabled, callback=None):
+        self._perf_mode = bool(enabled)
+        self._js_command('window.veliaPerfMode && window.veliaPerfMode(' +
+                         ('true' if enabled else 'false') + ')', callback)
+
+    def list_animations(self, callback):
+        self._js_command('window.veliaAnimationList && window.veliaAnimationList()', callback)
+
+    def display_animation(self, name, speed=1.0, loop=False, callback=None):
+        js = 'window.veliaDisplayAnimation && window.veliaDisplayAnimation(' + ','.join((
+            json.dumps(name, ensure_ascii=False), str(float(speed)),
+            'true' if loop else 'false')) + ')'
+        self._js_command(js, callback)
 
     def _request_setup(self):
         if not WEBENGINE_AVAILABLE:
@@ -500,6 +579,9 @@ class SpineRoomView(RoomView):
             self._warning(str(exc))
             return
         self._layer_order = None
+        self._deploying = perf is not None
+        self._held_keys.clear()
+        self._velocity_x = self._velocity_z = 0.0
         self.overlay = QWebEngineView(self)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.overlay.setStyleSheet('background:transparent;border:none;')
@@ -544,7 +626,7 @@ class SpineRoomView(RoomView):
             self.toggle_console()
             return True
         controlled = self.controlled_actor()
-        if self.console.isVisible() or controlled is None or controlled._sleeping:
+        if self.console.isVisible() or controlled is None or controlled._sleeping or controlled._deploying:
             self._held_keys.clear()
             return super().eventFilter(obj, event)
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
@@ -572,7 +654,7 @@ class SpineRoomView(RoomView):
         now = time.monotonic()
         dt = min(max(0.0, now - self._last_tick), 0.045)
         self._last_tick = now
-        if not self._ready or not self.isVisible():
+        if not self._ready or self._deploying or not self.isVisible():
             self._held_keys.clear()
             self._velocity_x = self._velocity_z = 0.0
             return
@@ -630,6 +712,7 @@ class SpineRoomView(RoomView):
 
     def _load_failed(self, message):
         self._ready = False
+        self._deploying = False
         self._ready_poll.stop()
         # Keep the failed renderer outside the room; never show loading UI.
         if self.overlay is not None:
@@ -637,7 +720,7 @@ class SpineRoomView(RoomView):
         print('[Velia Spine] ' + str(message), flush=True)
 
     def _poll_spine_readiness(self):
-        if self._ready or self.overlay is None:
+        if (self._ready and not self._deploying) or self.overlay is None:
             self._ready_poll.stop()
             return
         self._poll_count += 1
@@ -647,14 +730,15 @@ class SpineRoomView(RoomView):
             self.overlay.page().runJavaScript('document.title', self._on_spine_title)
         except RuntimeError:
             self._ready_poll.stop()
-        if self._poll_count >= 200:
+        if self._poll_count >= 200 and not self._ready:
             self._load_failed('Timed out waiting for Spine/Relax readiness (30 seconds)')
 
     def _on_spine_title(self, title):
         if title == 'VELIA_SPINE_READY' and not self._ready:
             # Deploy immediately once, keeping the selected random spawn.
             self._ready = True
-            self._ready_poll.stop()
+            if not self._deploying:
+                self._ready_poll.stop()
             self._moving_animation = False
             self._facing_left = False
             self._last_tick = time.monotonic()
@@ -664,6 +748,24 @@ class SpineRoomView(RoomView):
                 self.overlay.show()
                 self._keep_console_on_top()
                 QTimer.singleShot(0, self._keep_console_on_top)
+                if self._perf_mode and not self._deploying:
+                    self.set_perf_mode(True)
+        elif title == 'VELIA_SPINE_DEPLOYED' and self._deploying:
+            # Qt can coalesce rapid HTML title changes: deployment must also
+            # bring an actor on screen when the READY title was missed.
+            if not self._ready:
+                self._on_spine_title('VELIA_SPINE_READY')
+            # PERF/Start has completed and MOV/Relax is already active.
+            self._deploying = False
+            self._ready_poll.stop()
+            self._held_keys.clear()
+            self._npc_direction = (0, 0)
+            self._npc_timer_end = time.monotonic() + random.uniform(7.0, 16.0) if self._is_npc else 0.0
+            self._velocity_x = self._velocity_z = 0.0
+            self._last_tick = time.monotonic()
+            self._moving_animation = False
+            if self._perf_mode:
+                self.set_perf_mode(True)
         elif title == 'VELIA_SPINE_ERROR' and not self._ready:
             self._load_failed('Spine reported a skeleton / texture error')
 
@@ -710,7 +812,42 @@ function normalizeStage(player){
 let veliaMovPlayer=null;
 let veliaMotion='Relax';
 let veliaSleeping=false, veliaInteracting=false;
+
+let veliaDisplay=null;
+window.veliaAnimationList=function(){
+  if(!veliaMovPlayer) return 'System: MOV not loaded.';
+  const names=veliaMovPlayer.skeleton.data.animations.map(x=>x.name);
+  return 'mov/\\n'+names.map(n=>'  ├─ '+n).join('\\n');
+};
+window.veliaDisplayAnimation=function(name,speed,loop){
+  if(!veliaMovPlayer) return 'System: MOV not loaded.';
+  name=name.replace(/^mov\\//i,'');
+  const matched=veliaMovPlayer.skeleton.data.animations.find(a=>a.name.toLowerCase()===name.toLowerCase());
+  if(matched) name=matched.name;
+  const clip=veliaMovPlayer.skeleton.data.findAnimation(name);
+  if(!clip) return 'System: Animation not found: '+name;
+  veliaDisplay={name:name, speed:speed, loop:loop};
+  const st=veliaMovPlayer.animationState;
+  st.timeScale=files.motionSpeed*speed;
+  st.setAnimation(0,name,loop);
+  if(!loop){
+    st.addAnimation(0,'Relax',true,0);
+    st.addListener({complete:function(entry){
+      if(veliaDisplay && veliaDisplay.name===name && entry.animation && entry.animation.name===name){
+        veliaDisplay=null;st.timeScale=files.motionSpeed;veliaMotion='Relax';
+      }
+    }});
+  }
+  return 'System: Playing mov/'+name+' at '+speed+'x'+(loop?' (loop)':'');
+};
+function interruptDisplay(){
+  if(!veliaDisplay) return;
+  veliaDisplay=null;
+  veliaMovPlayer.animationState.timeScale=files.motionSpeed;
+}
+window.veliaPerfMode=function(flag){return 'System: PERF model is unavailable for this operator.';};
 window.veliaSetSleep=function(flag){
+  interruptDisplay();
   veliaSleeping=!!flag; veliaInteracting=false;
   if(!veliaMovPlayer || !veliaMovPlayer.animationState) return;
   const name=veliaSleeping?'Sleep':'Relax';
@@ -719,6 +856,7 @@ window.veliaSetSleep=function(flag){
   }
 };
 window.veliaInteract=function(){
+  interruptDisplay();
   if(veliaSleeping || veliaInteracting || !veliaMovPlayer) return;
   if(!veliaMovPlayer.skeleton.data.findAnimation('Interact')) return;
   veliaInteracting=true;
@@ -736,6 +874,8 @@ window.veliaSetDepthScale=function(scale){
   }
 };
 window.veliaSetMotion=function(moving, left){
+  if(moving && veliaDisplay) interruptDisplay();
+  else if(!moving && veliaDisplay) return;
   if(!veliaMovPlayer || !veliaMovPlayer.animationState || veliaSleeping) return;
   const current=veliaMovPlayer.animationState.getCurrent(0);
   // Movement interrupts Interact immediately; setAnimation also clears its queued Relax.
@@ -805,7 +945,122 @@ let perfPlayer=null;
 let movPlayer=null;
 let requestedMotion=false, requestedLeft=false, lastMovAnim='Relax';
 let veliaSleeping=false, veliaInteracting=false;
+
+let veliaDisplay=null, perfMode=false, hybridInstalled=false;
+let legPairs=[];
+function isLeg(name){
+  const n=name.toLowerCase();
+  return /(leg|thigh|calf|knee|shin|ankle|foot|toe|足|腿)/.test(n)
+      && !/(hair|coat|cape|cloth|skirt|weapon|effect)/.test(n);
+}
+function legMapping(){
+  if(!perfPlayer||!movPlayer) return [];
+  const source=new Map(movPlayer.skeleton.bones.map(b=>[b.data.name.toLowerCase(),b]));
+  return perfPlayer.skeleton.bones.filter(b=>isLeg(b.data.name)&&source.has(b.data.name.toLowerCase()))
+    .map(b=>[b,source.get(b.data.name.toLowerCase())]);
+}
+function installLegBlend(){
+  if(hybridInstalled||!perfPlayer||!movPlayer) return;
+  hybridInstalled=true;
+  const skeleton=perfPlayer.skeleton;
+  const original=skeleton.updateWorldTransform.bind(skeleton);
+  let last=performance.now();
+  skeleton.updateWorldTransform=function(){
+    if(perfMode && requestedMotion && !veliaDisplay && !veliaSleeping){
+      const now=performance.now(), dt=Math.min(.05,Math.max(0,(now-last)/1000));
+      movPlayer.animationState.update(dt);
+      movPlayer.animationState.apply(movPlayer.skeleton);
+      for(const pair of legPairs){
+        const dst=pair[0], src=pair[1];
+        dst.x=src.x; dst.y=src.y; dst.rotation=src.rotation;
+        dst.scaleX=src.scaleX; dst.scaleY=src.scaleY;
+        dst.shearX=src.shearX; dst.shearY=src.shearY;
+      }
+    }
+    last=performance.now();
+    return original();
+  };
+}
+window.veliaPerfMode=function(enabled){
+  if(!switched||!perfPlayer||!movPlayer) return 'System: PERF model unavailable or deploying.';
+  if(enabled && !perfPlayer.skeleton.data.findAnimation('Idle'))
+    return 'System: PERF/Idle animation not available.';
+  legPairs=legMapping();
+  if(enabled && (!movPlayer.skeleton.data.findAnimation('Move')||!legPairs.length))
+    return 'System: No compatible lower-body MOV bones; hybrid mode not enabled.';
+  perfMode=!!enabled;
+  veliaDisplay=null;
+  installLegBlend();
+  if(perfMode){
+    // PERF/Default is a one-frame showcase pose and must NEVER be used as idle.
+    // Re-activate the previously paused PERF player, then run Idle continuously
+    // so the upper body animates even while the operator is standing still.
+    perfPlayer.animationState.timeScale=files.motionSpeed;
+    perfPlayer.animationState.clearTracks();
+    perfPlayer.animationState.setAnimation(0,'Idle',true);
+    movPlayer.animationState.setAnimation(0,'Move',true);
+    if(perfPlayer.play) perfPlayer.play();
+    if(movPlayer.pause) movPlayer.pause();
+    document.getElementById('perf').style.visibility='visible';
+    document.getElementById('mov').style.visibility='hidden';
+  }else{
+    if(perfPlayer.pause) perfPlayer.pause();
+    if(movPlayer.play) movPlayer.play();
+    movPlayer.animationState.timeScale=files.motionSpeed;
+    movPlayer.animationState.setAnimation(0,requestedMotion?'Move':'Relax',true);
+    document.getElementById('perf').style.visibility='hidden';
+    document.getElementById('mov').style.visibility='visible';
+  }
+  return 'System: PERF mode '+(perfMode?'enabled ('+legPairs.length+' matched lower bones)':'disabled')+'.';
+};
+window.veliaAnimationList=function(){
+  const part=(label,p)=>label+'/\\n'+(p?p.skeleton.data.animations.map(a=>'  ├─ '+a.name).join('\\n'):'  (unavailable)');
+  return part('mov',movPlayer)+'\\n'+part('perf',perfPlayer);
+};
+window.veliaDisplayAnimation=function(name,speed,loop){
+  if(!switched) return 'System: Wait for deployment to finish.';
+  const prefix=/^(mov|perf)\\//i.exec(name);
+  const target=prefix?prefix[1].toLowerCase():null;
+  const asked=prefix?name.slice(prefix[0].length):name;
+  const resolve=(player)=>player&&player.skeleton.data.animations.find(a=>a.name.toLowerCase()===asked.toLowerCase());
+  const hasMov=resolve(movPlayer), hasPerf=resolve(perfPlayer);
+  const clipName=(target==='perf'?hasPerf:target==='mov'?hasMov:(hasMov||hasPerf))?.name||asked;
+  if(!target && hasMov && hasPerf) return 'System: Ambiguous animation; use mov/'+clipName+' or perf/'+clipName;
+  const model=target||(hasMov?'mov':hasPerf?'perf':null);
+  const player=model==='mov'?movPlayer:model==='perf'?perfPlayer:null;
+  if(!player||!player.skeleton.data.findAnimation(clipName))return 'System: Animation not found: '+name;
+  veliaDisplay={model:model,name:clipName,returnPerf:perfMode};
+  perfMode=false;
+  if(perfPlayer.pause) perfPlayer.pause();
+  if(movPlayer.pause) movPlayer.pause();
+  if(player.play) player.play();
+  const st=player.animationState;
+  st.timeScale=files.motionSpeed*speed;
+  st.clearTracks();
+  st.setAnimation(0,clipName,loop);
+  st.addListener({complete:function(entry){
+    if(!loop && veliaDisplay && veliaDisplay.model===model && veliaDisplay.name===clipName &&
+       entry.animation && entry.animation.name===clipName) interruptDisplay();
+  }});
+  document.getElementById('perf').style.visibility=model==='perf'?'visible':'hidden';
+  document.getElementById('mov').style.visibility=model==='mov'?'visible':'hidden';
+  return 'System: Playing '+model+'/'+clipName+' at '+speed+'x'+(loop?' (loop)':'');
+};
+function interruptDisplay(){
+  if(!veliaDisplay) return;
+  const restorePerf=veliaDisplay.returnPerf;
+  veliaDisplay=null;
+  for(const player of [movPlayer,perfPlayer]) if(player) player.animationState.timeScale=files.motionSpeed;
+  if(perfPlayer&&perfPlayer.pause)perfPlayer.pause();
+  if(movPlayer&&movPlayer.play)movPlayer.play();
+  document.getElementById('perf').style.visibility='hidden';
+  document.getElementById('mov').style.visibility='visible';
+  movPlayer.animationState.setAnimation(0,requestedMotion?'Move':'Relax',true);
+  lastMovAnim=requestedMotion?'Move':'Relax';
+  if(restorePerf) window.veliaPerfMode(true);
+}
 window.veliaSetSleep=function(flag){
+ interruptDisplay();
  veliaSleeping=!!flag; veliaInteracting=false;
  if(!movPlayer || !switched || !movPlayer.animationState) return;
  const anim=veliaSleeping?'Sleep':'Relax';
@@ -814,6 +1069,8 @@ window.veliaSetSleep=function(flag){
  }
 };
 window.veliaInteract=function(){
+ interruptDisplay();
+ if(perfMode){perfMode=false;interruptDisplay();if(perfPlayer.pause)perfPlayer.pause();if(movPlayer.play)movPlayer.play();document.getElementById('perf').style.visibility='hidden';document.getElementById('mov').style.visibility='visible';}
  if(!switched || veliaSleeping || veliaInteracting || !movPlayer || !movPlayer.skeleton.data.findAnimation('Interact')) return;
  veliaInteracting=true;
  movPlayer.animationState.setAnimation(0,'Interact',false);
@@ -831,6 +1088,13 @@ window.veliaSetDepthScale=function(scale){
   }
 };
 window.veliaSetMotion=function(moving,left){
+  if(moving && veliaDisplay) interruptDisplay();
+  else if(!moving && veliaDisplay) return;
+  if(perfMode){
+    requestedMotion=moving;requestedLeft=left;
+    const c=document.querySelector('#perf canvas');if(c)c.style.transform=left?'scaleX(-1)':'scaleX(1)';
+    return;
+  }
   requestedMotion=moving; requestedLeft=left;
   if(!switched || !movPlayer || !movPlayer.animationState || veliaSleeping) return;
   const current=movPlayer.animationState.getCurrent(0);
@@ -885,6 +1149,7 @@ function showRelax(){
   document.getElementById('perf').style.visibility='hidden';
   if(perfPlayer && perfPlayer.pause) perfPlayer.pause();
   window.veliaSetMotion(requestedMotion,requestedLeft);
+  document.title='VELIA_SPINE_DEPLOYED';
 }
 function readyPerf(player){
   perfPlayer=player;
@@ -1067,7 +1332,9 @@ new spine.SpinePlayer('mov',Object.assign({},params,{
         self._fit_overlay()
         if self.overlay is not None:
             self._ready = False
+            self._deploying = False
             self._poll_count = 0
             self._fit_overlay()
             self._ready_poll.start()
+            self._deploying = load_operator(self.operator_name, self.skin_number)[0] is not None
             self.overlay.reload()
