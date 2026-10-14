@@ -222,6 +222,14 @@ class MainWindow(QMainWindow):
         self.stage_title.setObjectName("cardTitle")
         phead.addWidget(self.stage_title)
         phead.addStretch()
+        self.operator_label = QLabel()
+        phead.addWidget(self.operator_label)
+        self.operator_combo = RoundedComboBox()
+        self.operator_combo.setMinimumWidth(140)
+        self.operator_combo.addItem("初雪 / Enya", "Enya")
+        self.operator_combo.addItem("令 / Ling", "Ling")
+        self.operator_combo.currentIndexChanged.connect(self._operator_changed)
+        phead.addWidget(self.operator_combo)
         self.wallpaper_label = QLabel()
         phead.addWidget(self.wallpaper_label)
         self.wallpaper_combo = RoundedComboBox()
@@ -232,8 +240,9 @@ class MainWindow(QMainWindow):
         self.to_room = self._button(action=lambda: self.stack.setCurrentWidget(self.room))
         phead.addWidget(self.to_room)
         pl.addLayout(phead)
-        self.stage = SpineRoomView()
+        self.stage = SpineRoomView(operator_name="Enya")
         self.stage.setObjectName("stage")
+        self.stage_layout = pl
         pl.addWidget(self.stage, 1)
         self._refresh_wallpapers()
         self.stack.addWidget(self.playground)
@@ -314,6 +323,29 @@ class MainWindow(QMainWindow):
         sl.addStretch()
         self.stack.addWidget(self.settings)
 
+    def _operator_changed(self, index):
+        """Switch controlled operator without mixing independent Spine skeletons."""
+        operator_name = self.operator_combo.itemData(index)
+        if not operator_name or operator_name == self.stage.operator_name:
+            return
+        operator_dir = ROOT / "resource" / "op" / operator_name
+        if not (operator_dir / "mov").is_dir():
+            QMessageBox.warning(self, "Velia Playground", f"Missing operator resource: {operator_dir / 'mov'}")
+            self.operator_combo.blockSignals(True)
+            self.operator_combo.setCurrentIndex(self.operator_combo.findData(self.stage.operator_name))
+            self.operator_combo.blockSignals(False)
+            return
+        previous = self.stage
+        new_stage = SpineRoomView(operator_name=operator_name)
+        new_stage.setObjectName("stage")
+        new_stage.set_theme("light" if self.prefs["theme"] == "light" else "dark")
+        new_stage.set_wallpaper(self.wallpaper_combo.currentData())
+        self.stage_layout.replaceWidget(previous, new_stage)
+        self.stage = new_stage
+        previous.close()
+        previous.setParent(None)
+        previous.deleteLater()
+
     def _enter_playground(self):
         self._refresh_wallpapers()
         self.stack.setCurrentWidget(self.playground)
@@ -353,6 +385,7 @@ class MainWindow(QMainWindow):
         self.playground_desc.setText(t("角色、互动与场景系统已清空，等待重新设计。", "Character, interaction and scene systems cleared for redesign."))
         self.enter_btn.setText(t("进入游乐场 ↗", "Enter Playground ↗"))
         self.stage_title.setText(t("游乐场 / 10 × 10 m", "Playground / 10 × 10 m"))
+        self.operator_label.setText(t("干员", "Operator"))
         self.wallpaper_label.setText(t("房间壁纸", "Room wallpaper"))
         self._refresh_wallpapers()
         self.to_room.setText(t("联机房间 ↗", "Multiplayer Room ↗"))
@@ -377,7 +410,7 @@ class MainWindow(QMainWindow):
         bg, panel, text, muted, border, button, hover, accent, active = (
             ("#f4f5f7","#ffffff","#131820","#637082","#d5dbe3","#ffffff","#edf0f4","#202831","#d7dfe9") if light else
             ("#101114","#1a1c21","#f4f5f7","#a6afbc","#393d45","#24272e","#363a43","#f0f2f5","#525864"))
-        for combo in (self.wallpaper_combo, self.theme_combo, self.language_combo):
+        for combo in (self.operator_combo, self.wallpaper_combo, self.theme_combo, self.language_combo):
             combo.set_dark(not light)
         self.stage.set_theme("light" if light else "dark")
         self.setStyleSheet(f"""
