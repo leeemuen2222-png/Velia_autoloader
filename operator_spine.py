@@ -245,26 +245,26 @@ class RoomConsole(QFrame):
                 self.log.appendPlainText(
                     'Available commands:\n'
                     '//help — Show all available commands and their functions.\n'
-                    '//gotosleep — Enter sleep mode, stop movement, and loop Sleep.\n'
-                    '//wakeup — Exit sleep mode and resume movement and Relax.\n'
-                    '//oppick NAME — Control an operator already in the room.\n'
-                    '//oplist — List all installed operators.\n'
-                    '//oprelease — Release all operators from the room.\n'
-                    '//listskin — List skins for the controlled operator.\n'
-                    '//skinpick NUMBER — Switch the controlled operator to a skin.\n'
+                    '//op sleep — Enter sleep mode, stop movement, and loop Sleep.\n'
+                    '//op wake — Exit sleep mode and resume movement and Relax.\n'
+                    '//op seize NAME — Control an operator already in the room.\n'
+                    '//op list — List all installed operators.\n'
+                    '//releaseall — Release all operators from the room.\n'
+                    '//skin list — List skins for the controlled operator.\n'
+                    '//skin pick NUMBER — Switch the controlled operator to a skin.\n'
                     '//perfmode [true|false] — Toggle PERF idle and lower-body MOV blend.\n'
                     '//ani list — List MOV and PERF animation names.\n'
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
                 )
-            elif content == 'gotosleep':
+            elif content == 'op sleep':
                 self.room.controlled_actor().set_sleeping(True) if self.room.controlled_actor() else None
                 self.log.appendPlainText('System: Sleeping.')
-            elif content == 'wakeup':
+            elif content == 'op wake':
                 self.room.controlled_actor().set_sleeping(False) if self.room.controlled_actor() else None
                 self.log.appendPlainText('System: Awake.')
-            elif content == 'listskin':
+            elif content == 'skin list':
                 actor = self.room.controlled_actor()
                 if actor is None:
                     self.log.appendPlainText('System: No operator is currently controlled.')
@@ -273,15 +273,15 @@ class RoomConsole(QFrame):
                     self.log.appendPlainText('Available skins (' + actor.operator_name + '):\n' +
                                              ('\\n'.join(f'{idx}. {entry["label"]}' for idx, entry in skins.items())
                                               or '(none)'))
-            elif content.startswith('skinpick'):
+            elif content.startswith('skin pick'):
                 pieces = content.split()
                 actor = self.room.controlled_actor()
-                if len(pieces) != 2 or not pieces[1].isdecimal():
-                    self.log.appendPlainText('System: Usage //skinpick NUMBER')
+                if len(pieces) != 3 or not pieces[2].isdecimal():
+                    self.log.appendPlainText('System: Usage //skin pick NUMBER')
                 elif actor is None:
                     self.log.appendPlainText('System: No operator is currently controlled.')
-                elif actor.select_skin(int(pieces[1])):
-                    self.log.appendPlainText(f'System: {actor.operator_name} skin {pieces[1]} selected.')
+                elif actor.select_skin(int(pieces[2])):
+                    self.log.appendPlainText(f'System: {actor.operator_name} skin {pieces[2]} selected.')
                 else:
                     self.log.appendPlainText('System: Skin unavailable or could not load.')
             elif content == 'perfmode' or content.startswith('perfmode '):
@@ -325,17 +325,17 @@ class RoomConsole(QFrame):
                         self.log.appendPlainText('System: Usage //ani display NAME [SPEED>0] [loop]')
                     else:
                         actor.display_animation(name, speed, loop, self.log.appendPlainText)
-            elif content == 'oplist':
+            elif content == 'op list':
                 self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
-            elif content == 'oprelease':
+            elif content == 'releaseall':
                 self.room.release_all()
                 self.log.appendPlainText('System: All operators released.')
-            elif content.startswith('oppick '):
-                target = content[7:].strip()
+            elif content.startswith('op seize '):
+                target = content[len('op seize '):].strip()
                 if self.room.pick_operator(target):
                     self.log.appendPlainText('System: Controlling ' + self.room.controlled_actor().operator_name)
                 else:
-                    self.log.appendPlainText('System: Operator not present. Use //oplist.')
+                    self.log.appendPlainText('System: Operator not present. Use //op list.')
             else:
                 self.log.appendPlainText('System: Unknown command.')
         else:
@@ -948,15 +948,29 @@ let veliaSleeping=false, veliaInteracting=false;
 
 let veliaDisplay=null, perfMode=false, hybridInstalled=false;
 let legPairs=[];
+let blendSamples=0;
 function isLeg(name){
   const n=name.toLowerCase();
-  return /(leg|thigh|calf|knee|shin|ankle|foot|toe|足|腿)/.test(n)
-      && !/(hair|coat|cape|cloth|skirt|weapon|effect)/.test(n);
+  return /(leg|thigh|calf|knee|shin|ankle|foot|toe|hip|pelvis|足|腿|胯|髋)/.test(n)
+      && !/(hair|coat|cape|cloth|skirt|weapon|effect|finger)/.test(n);
 }
 function legMapping(){
   if(!perfPlayer||!movPlayer) return [];
   const source=new Map(movPlayer.skeleton.bones.map(b=>[b.data.name.toLowerCase(),b]));
-  return perfPlayer.skeleton.bones.filter(b=>isLeg(b.data.name)&&source.has(b.data.name.toLowerCase()))
+  const legRoot=(bone)=>{
+    let b=bone;
+    while(b){
+      const name=b.data.name.toLowerCase();
+      if(/(leg|thigh|calf|knee|shin|ankle|foot|toe|足|腿)/.test(name) &&
+         !/(hair|coat|cape|cloth|skirt|weapon|effect|finger)/.test(name)) return true;
+      b=b.parent;
+    }
+    return false;
+  };
+  // Include both leg-chain helper bones (even if unnamed) and pelvis/hip.
+  // Thorns uses multiple F_/B_ leg branches and pelvis-driven movement.
+  return perfPlayer.skeleton.bones.filter(b=>
+    (isLeg(b.data.name)||legRoot(b)) && source.has(b.data.name.toLowerCase()))
     .map(b=>[b,source.get(b.data.name.toLowerCase())]);
 }
 function installLegBlend(){
@@ -1011,7 +1025,7 @@ window.veliaPerfMode=function(enabled){
     document.getElementById('perf').style.visibility='hidden';
     document.getElementById('mov').style.visibility='visible';
   }
-  return 'System: PERF mode '+(perfMode?'enabled ('+legPairs.length+' matched lower bones)':'disabled')+'.';
+  return 'System: PERF mode '+(perfMode?'enabled ('+legPairs.length+' mapped lower-body bones including hip and leg helpers)':'disabled')+'.';
 };
 window.veliaAnimationList=function(){
   const part=(label,p)=>label+'/\\n'+(p?p.skeleton.data.animations.map(a=>'  ├─ '+a.name).join('\\n'):'  (unavailable)');
