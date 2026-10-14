@@ -1365,6 +1365,7 @@ new spine.SpinePlayer('mov',Object.assign({},params,{
             'movSkel':mov_skel,'movAtlas':mov_atlas}.items()}
         conf['motionSpeed'] = speed_multiplier(self.operator_name)
         conf['operatorName'] = self.operator_name
+        conf['skinNumber'] = self.skin_number
         lib_url = file_url(js)
         css_url = file_url(css)
         # The player bounds are normalized to the whole overlay, independent of
@@ -1735,7 +1736,13 @@ function initializeSharedCamera(player){
   if(!(size.x>0 && size.y>0)) return false;
   const box=player.parent.getBoundingClientRect();
   const ratio=Math.max(.1,box.width/Math.max(1,box.height));
-  const baseHeight=Math.max(size.y/.80,size.x/(ratio*.85));
+  // Ling's skin-3 costume extends the visible bounds well beyond her body.
+  // Fitting the full artwork makes the operator appear smaller after switching.
+  // Use ONE canonical skeletal-unit scale for all Ling skins; never infer
+  // character height from individual costume/weapon/FX bounds.
+  const baseHeight=files.operatorName==='Ling'
+    ? 450/.80
+    : Math.max(size.y/.80,size.x/(ratio*.85));
   const worldHeight=baseHeight*3.0; // account for large Start effects
   const worldWidth=worldHeight*ratio;
   // Do NOT center on (offset.x, offset.y) from the current animation.

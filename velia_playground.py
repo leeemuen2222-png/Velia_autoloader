@@ -325,8 +325,8 @@ class OperatorCard(AnimatedButton):
         self.preview_placeholder = QLabel('MOV / Relax')
         self.preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.preview_placeholder.setMinimumSize(85, 82)
-        self.preview_placeholder.setMaximumHeight(82)
+        self.preview_placeholder.setMinimumSize(110, 146)
+        self.preview_placeholder.setMaximumHeight(146)
         self.preview_placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._layout.addWidget(self.preview_placeholder)
 
@@ -348,8 +348,22 @@ new spine.SpinePlayer('preview',{skelUrl:c.skel,atlasUrl:c.atlas,animation:'Rela
 showControls:false,alpha:true,backgroundColor:'#00000000',premultipliedAlpha:true,
 showLoading:false,success:function(player){const o=new spine.Vector2(),z=new spine.Vector2();
 player.skeleton.updateWorldTransform();player.skeleton.getBounds(o,z);
-const h=Math.max(z.y/0.80,z.x/1.7)*0.625;
-player.currentViewport={x:o.x+z.x/2-h*0.9,y:o.y-h*0.12,width:h*1.8,height:h,padLeft:0,padRight:0,padTop:0,padBottom:0};
+// Use one shared on-screen target for every operator, calibrated to
+// Enya's card preview. The source atlas's pixel dimensions are irrelevant.
+// Keep the complete visible geometry in view if an attachment is unusually wide.
+const el=document.getElementById('preview');
+const cw=Math.max(1,el.clientWidth), ch=Math.max(1,el.clientHeight);
+const aspect=Math.max(0.5,cw/ch);
+const targetHeightPx=118;
+const margin=1.10;
+// Size by the CHARACTER'S HEIGHT, never by overall width. Ling's very wide
+// decoration/tail makes width-fitting shrink her to a tiny sprite.
+const h=Math.max(1,z.y)*ch/targetHeightPx*margin;
+const w=h*aspect;
+// Align visual feet consistently, regardless of how far the attachments
+// extend horizontally. The X centre still follows each skeleton's geometry.
+player.currentViewport={x:o.x+z.x/2-w/2,y:o.y+z.y/2-h/2,
+width:w,height:h,padLeft:0,padRight:0,padTop:0,padBottom:0};
 player.previousViewport=null;}});
 </script></body></html>''' % (playercss, playerjs, settings)
                 self.preview = QWebEngineView(self)
@@ -358,8 +372,8 @@ player.previousViewport=null;}});
                 self.preview.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
                 self.preview.page().setBackgroundColor(QColor(0,0,0,0))
                 self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,True)
-                self.preview.setMinimumSize(85,82)
-                self.preview.setMaximumHeight(82)
+                self.preview.setMinimumSize(110,146)
+                self.preview.setMaximumHeight(146)
                 self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 self.preview.setHtml(html,QUrl.fromLocalFile(str(ROOT)+'/'))
                 self._layout.replaceWidget(self.preview_placeholder, self.preview)
