@@ -199,11 +199,55 @@ def parse_console_entry(value):
     return ('speech', value)
 
 
+CONSOLE_COMMANDS = (
+    '//help', '//op sleep', '//op wake', '//op seize ', '//op list',
+    '//releaseall', '//skin list', '//skin pick ', '//perfmode true',
+    '//perfmode false', '//ani list', '//ani display ',
+    '//command autocomplete true', '//command autocomplete false',
+    '//command off', '//command on',
+)
+
+
+class CommandLineEdit(QLineEdit):
+    """Console input with completion and PageUp/PageDown command history."""
+    def __init__(self, console):
+        super().__init__(console)
+        self.console = console
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key.Key_PageUp and self.text().startswith('//'):
+            self.console._history_step(-1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_PageDown and self.text().startswith('//'):
+            self.console._history_step(1)
+            event.accept()
+            return
+        if key == Qt.Key.Key_Tab and self.console._accept_completion():
+            event.accept()
+            return
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.console._accept_completion():
+                event.accept()
+                return
+            self.console._submit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class RoomConsole(QFrame):
     """Bottom overlay: command input now, reusable speech log for multiplayer later."""
     def __init__(self, room):
         super().__init__(room)
         self.room = room
+        self._autocomplete_enabled = True
+        self._commands_enabled = True
+        self._history = []
+        self._history_index = None
+        self._history_draft = ''
+        self._completion = None
         self.setObjectName('roomConsole')
         self.setStyleSheet("""
             QFrame#roomConsole { background: rgba(0, 0, 0, 145);
@@ -223,28 +267,93 @@ class RoomConsole(QFrame):
         self.log.setMaximumBlockCount(200)
         self.log.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         layout.addWidget(self.log, 1)
+        self.suggestion = QLabel('', self)
+        self.suggestion.setStyleSheet('color: #aabbd3; font: 12px Consolas;')
+        self.suggestion.hide()
+        layout.addWidget(self.suggestion)
         line = QHBoxLayout()
         line.setSpacing(9)
         line.addWidget(QLabel('>', self))
-        self.edit = QLineEdit(self)
+        self.edit = CommandLineEdit(self)
         self.edit.setPlaceholderText('type a command or message use //help to see a list of command')
-        self.edit.returnPressed.connect(self._submit)
+        self.edit.textChanged.connect(self._on_input_changed)
         line.addWidget(self.edit, 1)
         layout.addLayout(line)
         self.hide()
 
+    def _on_input_changed(self, value):
+        self._completion = None
+        if not self._autocomplete_enabled or not value.startswith('//'):
+            self.suggestion.hide()
+            return
+        pool = CONSOLE_COMMANDS if self._commands_enabled else ('//command on',)
+        candidate = next((item for item in pool if item.casefold().startswith(value.casefold())
+                          and item.casefold() != value.casefold()), None)
+        if candidate is None:
+            self.suggestion.hide()
+            return
+        self._completion = candidate
+        self.suggestion.setText('TAB / ENTER  →  ' + candidate)
+        self.suggestion.show()
+
+    def _accept_completion(self):
+        if not self._completion or not self._autocomplete_enabled:
+            return False
+        target = self._completion
+        self.edit.setText(target)
+        self.edit.setCursorPosition(len(target))
+        # A completed command is executed on the next Enter; never execute it
+        # merely because an autocomplete suggestion was accepted.
+        return True
+
+    def _history_step(self, direction):
+        if not self._history:
+            return
+        if self._history_index is None:
+            self._history_draft = self.edit.text()
+            self._history_index = len(self._history)
+        self._history_index = min(len(self._history), max(0, self._history_index + direction))
+        value = (self._history_draft if self._history_index == len(self._history)
+                 else self._history[self._history_index])
+        self.edit.setText(value)
+        self.edit.setCursorPosition(len(value))
+
     def _submit(self):
         raw = self.edit.text()
         self.edit.clear()
+        self._history_index = None
+        self._history_draft = ''
         kind, content = parse_console_entry(raw)
         if kind == 'empty':
             return
         self.log.appendPlainText('> ' + raw.strip())
         if kind == 'command':
-            if content == 'help':
+            if not self._history or self._history[-1] != raw.strip():
+                self._history.append(raw.strip())
+                self._history = self._history[-100:]
+            if content == 'command on':
+                self._commands_enabled = True
+                self.log.appendPlainText('System: Command interface enabled.')
+            elif not self._commands_enabled:
+                self.log.appendPlainText('System: Commands disabled. Use //command on.')
+            elif content == 'command off':
+                self._commands_enabled = False
+                self.log.appendPlainText('System: Commands disabled. Use //command on to restore.')
+            elif content.startswith('command autocomplete'):
+                pieces = content.split()
+                if len(pieces) != 3 or pieces[2] not in ('true', 'false'):
+                    self.log.appendPlainText('System: Usage //command autocomplete true|false')
+                else:
+                    self._autocomplete_enabled = pieces[2] == 'true'
+                    self._on_input_changed(self.edit.text())
+                    self.log.appendPlainText('System: Autocomplete ' + ('enabled.' if self._autocomplete_enabled else 'disabled.'))
+            elif content == 'help':
                 self.log.appendPlainText(
                     'Available commands:\n'
                     '//help — Show all available commands and their functions.\n'
+                    '//command autocomplete true|false — Toggle command completion.\n'
+                    '//command off — Disable all commands except //command on.\n'
+                    '//command on — Restore command access.\n'
                     '//op sleep — Enter sleep mode, stop movement, and loop Sleep.\n'
                     '//op wake — Exit sleep mode and resume movement and Relax.\n'
                     '//op seize NAME — Control an operator already in the room.\n'
