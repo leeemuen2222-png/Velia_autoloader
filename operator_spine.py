@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, QTimer, QEvent
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QLabel, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox
+from PySide6.QtWidgets import QLabel, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QPushButton
 
 from room_view import ROOM_SIDE_M, RoomView
 
@@ -109,6 +109,86 @@ def height_multiplier(name):
         return 1.0
 
 
+def parse_console_entry(value):
+    """Return ('command'|'speech'|'empty', payload).
+
+    Any angle-bracket pair marks an ordinary speech line, even with //.
+    """
+    value = value.strip()
+    if not value:
+        return ('empty', '')
+    if '<' in value and '>' in value and value.index('<') < value.rindex('>'):
+        return ('speech', value)
+    if value.startswith('//'):
+        return ('command', value[2:].strip().lower())
+    return ('speech', value)
+
+
+class RoomConsole(QFrame):
+    """Bottom overlay: command input now, reusable speech log for multiplayer later."""
+    def __init__(self, room):
+        super().__init__(room)
+        self.room = room
+        self.setObjectName('roomConsole')
+        self.setStyleSheet("""
+            QFrame#roomConsole { background: rgba(0, 0, 0, 145);
+                border: 1px solid rgba(255,255,255,65); border-radius: 14px; }
+            QPlainTextEdit { color: #f4f5f6; background: transparent; border: none;
+                selection-background-color: #667080; font: 12px Consolas; }
+            QLineEdit { color: white; background: transparent; border: none;
+                selection-background-color: #596474; font: 13px Consolas; }
+            QLabel { color: #d1d5db; background: transparent; border: none;
+                font: bold 14px Consolas; }
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(6)
+        self.log = QPlainTextEdit(self)
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(200)
+        self.log.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        layout.addWidget(self.log, 1)
+        line = QHBoxLayout()
+        line.setSpacing(9)
+        line.addWidget(QLabel('>', self))
+        self.edit = QLineEdit(self)
+        self.edit.setPlaceholderText('type a command or message use //help to see a list of command')
+        self.edit.returnPressed.connect(self._submit)
+        line.addWidget(self.edit, 1)
+        layout.addLayout(line)
+        self.hide()
+
+    def _submit(self):
+        raw = self.edit.text()
+        self.edit.clear()
+        kind, content = parse_console_entry(raw)
+        if kind == 'empty':
+            return
+        self.log.appendPlainText('> ' + raw.strip())
+        if kind == 'command':
+            if content == 'help':
+                self.log.appendPlainText(
+                    'Available commands:\n'
+                    '//help — Show all available commands and their functions.\n'
+                    '//gotosleep — Enter sleep mode, stop movement, and loop Sleep.\n'
+                    '//wakeup — Exit sleep mode and resume movement and Relax.\n'
+                    'Tip: Commands begin with //; other text is speech. '
+                    'Text containing <...> is always speech.'
+                )
+            elif content == 'gotosleep':
+                self.room.set_sleeping(True)
+                self.log.appendPlainText('System: Sleeping.')
+            elif content == 'wakeup':
+                self.room.set_sleeping(False)
+                self.log.appendPlainText('System: Awake.')
+            else:
+                self.log.appendPlainText('System: Unknown command.')
+        else:
+            # Keep speech local in this single-player view. Multiplayer transport
+            # will be wired when the networked room stage is implemented.
+            self.log.appendPlainText('You: ' + content)
+
+
 class SpineRoomView(RoomView):
     """Room with one initially stationary Spine 3.8 operator above the floor."""
     def __init__(self, parent=None, operator_name='Enya'):
@@ -126,6 +206,7 @@ class SpineRoomView(RoomView):
         self._held_keys = set()
         self._last_tick = time.monotonic()
         self._moving_animation = False
+        self._sleeping = False
         self._facing_left = False
         self._velocity_x = 0.0
         self._velocity_z = 0.0
@@ -139,6 +220,17 @@ class SpineRoomView(RoomView):
         # App-level filter keeps WASD functional even if a Qt button has focus.
         QApplication.instance().installEventFilter(self)
         self._request_setup()
+        self.console = RoomConsole(self)
+        self.console.setGeometry(18, max(10, self.height()-225), max(200, self.width()-36), 205)
+        self._keep_console_on_top()
+
+    def _keep_console_on_top(self):
+        """Keep translucent command panel above the Chromium Spine surface."""
+        if not hasattr(self, "console"):
+            return
+        if self.overlay is not None:
+            self.overlay.stackUnder(self.console)
+        self.console.raise_()
 
     def _request_setup(self):
         if not WEBENGINE_AVAILABLE:
@@ -177,6 +269,7 @@ class SpineRoomView(RoomView):
         self.overlay.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.overlay.setMouseTracking(False)
+        self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         # NEVER hide the WebEngine: hidden Chromium surfaces may not render,
         # so Spine never reaches the first-frame readiness callback.
         # Instead keep it alive completely outside the visible room until ready.
@@ -206,6 +299,13 @@ class SpineRoomView(RoomView):
             return super().eventFilter(obj, event)
         focus = QApplication.focusWidget()
         if isinstance(focus, (QLineEdit,QTextEdit,QPlainTextEdit,QSpinBox,QDoubleSpinBox,QComboBox)):
+            self._held_keys.clear()
+            return super().eventFilter(obj, event)
+        if event.key() == Qt.Key.Key_C and typ == QEvent.Type.KeyPress and not event.isAutoRepeat():
+            self.toggle_console()
+            return True
+        if self.console.isVisible() or self._sleeping:
+            self._held_keys.clear()
             return super().eventFilter(obj, event)
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
         key = key_map.get(event.key())
@@ -237,6 +337,10 @@ class SpineRoomView(RoomView):
             self._velocity_x = self._velocity_z = 0.0
             return
 
+        if self._sleeping:
+            self._held_keys.clear()
+            self._velocity_x = self._velocity_z = 0.0
+            return
         input_x = float('d' in self._held_keys) - float('a' in self._held_keys)
         input_z = float('s' in self._held_keys) - float('w' in self._held_keys)
         distance = math.hypot(input_x, input_z)
@@ -316,7 +420,8 @@ class SpineRoomView(RoomView):
             if self.overlay is not None:
                 self._fit_overlay()
                 self.overlay.show()
-                self.overlay.raise_()
+                self._keep_console_on_top()
+                QTimer.singleShot(0, self._keep_console_on_top)
         elif title == 'VELIA_SPINE_ERROR' and not self._ready:
             self._load_failed('Spine reported a skeleton / texture error')
 
@@ -361,6 +466,24 @@ function normalizeStage(player){
 }
 let veliaMovPlayer=null;
 let veliaMotion='Relax';
+let veliaSleeping=false, veliaInteracting=false;
+window.veliaSetSleep=function(flag){
+  veliaSleeping=!!flag; veliaInteracting=false;
+  if(!veliaMovPlayer || !veliaMovPlayer.animationState) return;
+  const name=veliaSleeping?'Sleep':'Relax';
+  if(veliaMovPlayer.skeleton.data.findAnimation(name)){
+    veliaMotion=name; veliaMovPlayer.animationState.setAnimation(0,name,true);
+  }
+};
+window.veliaInteract=function(){
+  if(veliaSleeping || veliaInteracting || !veliaMovPlayer) return;
+  if(!veliaMovPlayer.skeleton.data.findAnimation('Interact')) return;
+  veliaInteracting=true;
+  const state=veliaMovPlayer.animationState;
+  state.setAnimation(0,'Interact',false);
+  state.addAnimation(0,'Relax',true,0);
+};
+
 window.veliaSetDepthScale=function(scale){
   const safe=Math.max(.01,Math.min(5,Number(scale)||1));
   for(const el of [document.getElementById('mov'),document.getElementById('perf')]){
@@ -370,7 +493,14 @@ window.veliaSetDepthScale=function(scale){
   }
 };
 window.veliaSetMotion=function(moving, left){
-  if(!veliaMovPlayer || !veliaMovPlayer.animationState) return;
+  if(!veliaMovPlayer || !veliaMovPlayer.animationState || veliaSleeping) return;
+  const current=veliaMovPlayer.animationState.getCurrent(0);
+  // Movement interrupts Interact immediately; setAnimation also clears its queued Relax.
+  if(moving && current && current.animation && current.animation.name==='Interact'){
+    veliaInteracting=false;
+    veliaMotion='Interact';
+  } else if(!moving && current && current.animation && current.animation.name==='Interact' && !current.isComplete()) return;
+  if(veliaInteracting && current && current.animation && current.animation.name==='Relax') veliaInteracting=false;
   const anim=moving && veliaMovPlayer.skeleton.data.findAnimation('Move') ? 'Move':'Relax';
   // Skeletal scale mirror: right is the original direction, left is mirrored.
   const canvas=document.querySelector('#mov canvas');
@@ -431,6 +561,24 @@ let switched=false;
 let perfPlayer=null;
 let movPlayer=null;
 let requestedMotion=false, requestedLeft=false, lastMovAnim='Relax';
+let veliaSleeping=false, veliaInteracting=false;
+window.veliaSetSleep=function(flag){
+ veliaSleeping=!!flag; veliaInteracting=false;
+ if(!movPlayer || !switched || !movPlayer.animationState) return;
+ const anim=veliaSleeping?'Sleep':'Relax';
+ if(movPlayer.skeleton.data.findAnimation(anim)){
+   lastMovAnim=anim; movPlayer.animationState.setAnimation(0,anim,true);
+ }
+};
+window.veliaInteract=function(){
+ if(!switched || veliaSleeping || veliaInteracting || !movPlayer || !movPlayer.skeleton.data.findAnimation('Interact')) return;
+ veliaInteracting=true;
+ movPlayer.animationState.setAnimation(0,'Interact',false);
+ movPlayer.animationState.addAnimation(0,'Relax',true,0);
+ movPlayer.animationState.addListener({complete:function(entry){
+   if(entry.animation && entry.animation.name==='Interact') veliaInteracting=false;
+ }});
+};
 window.veliaSetDepthScale=function(scale){
   const safe=Math.max(.01,Math.min(5,Number(scale)||1));
   for(const el of [document.getElementById('mov'),document.getElementById('perf')]){
@@ -441,7 +589,14 @@ window.veliaSetDepthScale=function(scale){
 };
 window.veliaSetMotion=function(moving,left){
   requestedMotion=moving; requestedLeft=left;
-  if(!switched || !movPlayer || !movPlayer.animationState) return;
+  if(!switched || !movPlayer || !movPlayer.animationState || veliaSleeping) return;
+  const current=movPlayer.animationState.getCurrent(0);
+  // Movement cancels Interact instead of allowing it to finish or resume.
+  if(moving && current && current.animation && current.animation.name==='Interact'){
+    veliaInteracting=false;
+    lastMovAnim='Interact';
+  } else if(!moving && current && current.animation && current.animation.name==='Interact' && !current.isComplete()) return;
+  if(veliaInteracting && current && current.animation && current.animation.name==='Relax') veliaInteracting=false;
   const anim=moving && movPlayer.skeleton.data.findAnimation('Move') ? 'Move':'Relax';
   const canvas=document.querySelector('#mov canvas');
   if(canvas) canvas.style.transform=left ? 'scaleX(-1)' : 'scaleX(1)';
@@ -558,11 +713,57 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
             self.overlay.page().runJavaScript(
                 'window.veliaSetDepthScale && window.veliaSetDepthScale(' +
                 format(depth_scale, '.6f') + ');')
-        self.overlay.raise_()
+        if hasattr(self, 'console'):
+            self._keep_console_on_top()
+
+    def toggle_console(self):
+        if self.console.isVisible():
+            self.console.hide()
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            self._held_keys.clear()
+            self._velocity_x = self._velocity_z = 0.0
+            self._set_motion_animation(False, self._facing_left)
+            self.console.show()
+            self._keep_console_on_top()
+            self.console.edit.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def set_sleeping(self, sleeping):
+        sleeping = bool(sleeping)
+        if sleeping == self._sleeping:
+            return
+        self._sleeping = sleeping
+        self._held_keys.clear()
+        self._velocity_x = self._velocity_z = 0.0
+        if self.overlay and self._ready:
+            self.overlay.page().runJavaScript(
+                'window.veliaSetSleep && window.veliaSetSleep(' +
+                ('true' if sleeping else 'false') + ');')
+        if not sleeping:
+            self._moving_animation = False
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._ready and not self._sleeping:
+            w, h = float(self.width()), float(self.height())
+            t = self._depth_fraction(self.spawn_z)
+            half = min(w * .315, h * .49) + (min(w * .466, h * .90) - min(w * .315, h * .49)) * t
+            center_x = w / 2 + (self.spawn_x / ROOM_SIDE_M * 2 - 1) * half
+            foot_y = h * (.48 + (.925 - .48) * t)
+            character_h = (150.0 + 50.0 * self.spawn_z / ROOM_SIDE_M) / 733.0 * h * height_multiplier(self.operator_name)
+            # Bounding box is intentionally conservative for moving Spine parts.
+            if abs(event.position().x() - center_x) <= character_h * .52 and foot_y-character_h <= event.position().y() <= foot_y:
+                self.overlay.page().runJavaScript('window.veliaInteract && window.veliaInteract();')
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_overlay()
+        if hasattr(self, 'console'):
+            self.console.setGeometry(18, max(10, self.height() - 225),
+                                     max(200, self.width() - 36), 205)
+            self._keep_console_on_top()
 
     def closeEvent(self, event):
         self._walk_timer.stop()
@@ -572,6 +773,7 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
     def spawn_again(self):
         """Fresh random position; restart the operator's configured animation."""
         self._held_keys.clear()
+        self._sleeping = False
         self._velocity_x = self._velocity_z = 0.0
         self._last_depth_scale = None
         self.spawn_x, self.spawn_z = sample_spawn()
