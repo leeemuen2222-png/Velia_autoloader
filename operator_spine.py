@@ -217,6 +217,42 @@ def parse_console_entry(value):
     return ('speech', value)
 
 
+
+_ANIM_MODIFIERS = re.compile(r"(?i)^(?P<name>[^{}\s]+)(?:\{(?P<mods>[^{}]*)\})?$")
+
+
+def parse_alloc_animation(token):
+    """Read a per-animation optional modifier block, without changing clip names."""
+    match = _ANIM_MODIFIERS.fullmatch(token)
+    if not match:
+        raise ValueError('Invalid animation/modifier syntax: ' + token)
+    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal'}
+    if match.group('mods') is not None:
+        if not match.group('mods').strip():
+            return item
+        used = set()
+        for part in match.group('mods').split(','):
+            if '=' not in part:
+                raise ValueError('Expected key=value in modifier: ' + part)
+            key, value = (piece.strip().lower() for piece in part.split('=', 1))
+            if key in used or key not in ('speed', 'flip', 'play'):
+                raise ValueError('Unknown or duplicate animation modifier: ' + key)
+            used.add(key)
+            if key == 'speed':
+                try:
+                    value = float(value)
+                except ValueError:
+                    raise ValueError('Invalid speed') from None
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError('Speed must be positive and finite')
+            elif key == 'flip' and value not in ('auto','up','down','left','right'):
+                raise ValueError('flip must be auto/up/down/left/right')
+            elif key == 'play' and value not in ('normal','backward'):
+                raise ValueError('play must be normal/backward')
+            item[key] = value
+    return item
+
+
 CONSOLE_COMMANDS = (
     '//help', '//op sleep', '//op wake', '//op seize ', '//op list',
     '//releaseall', '//skin list', '//skin pick ', '//perfmode true',
@@ -393,7 +429,8 @@ class RoomConsole(QFrame):
                     '//perfmode [true|false] — Toggle PERF idle and lower-body MOV blend.\n'
                     '//ani list — List MOV and PERF animation names.\n'
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
-                    '//ani alloc NAME [SPEED] [loop|single] KEY — Bind animation to key.\n'
+                    '//ani alloc ANIMATION{modifiers} [...] KEY — Bind an animation sequence to a key.\n'
+                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward} (optional after any animation).\n'
                     'E in PERF mode — Play Attack (or Attack_1) without stopping walking.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
@@ -470,34 +507,32 @@ class RoomConsole(QFrame):
                 actor = self.room.controlled_actor()
                 if actor is None:
                     self.log.appendPlainText('System: No controlled operator.')
-                elif len(args) < 4 or len(args) > 6:
-                    self.log.appendPlainText('System: Usage //ani alloc NAME [SPEED] [loop|single] KEY')
+                elif len(args) < 4:
+                    self.log.appendPlainText('System: Usage //ani alloc ANIMATION{modifiers} [ANIMATION{modifiers} ...] KEY')
                 else:
-                    name, keyname = args[2], args[-1].upper()
-                    modifiers = args[3:-1]
-                    speed, loop, valid = 1.0, False, True
-                    for modifier in modifiers:
-                        if modifier in ('single', 'loop'):
-                            loop = modifier == 'loop'
-                        else:
-                            try:
-                                speed = float(modifier)
-                            except ValueError:
-                                valid = False
-                    # Avoid stealing text keys, movement, Console access and built-in attack.
-                    if not re.fullmatch(r'[A-Z0-9]|F(?:[1-9]|1[0-2])|SPACE', keyname) or keyname in ('W','A','S','D','C','E'):
-                        valid = False
-                    if not math.isfinite(speed) or speed <= 0:
-                        valid = False
-                    if not valid:
-                        self.log.appendPlainText('System: Invalid binding or reserved key (W/A/S/D/C/E).')
+                    keyname = args[-1].upper()
+                    tokens = args[2:-1]
+                    # Preserve legacy trailing loop/single in pre-existing commands.
+                    sequence_loop = False
+                    if tokens and tokens[-1].lower() in ('loop','single'):
+                        sequence_loop = tokens.pop().lower() == 'loop'
+                    try:
+                        clips = [parse_alloc_animation(token) for token in tokens]
+                        if not clips:
+                            raise ValueError('At least one animation is required')
+                        if not re.fullmatch(r'[A-Z0-9]|F(?:[1-9]|1[0-2])|SPACE', keyname) or keyname in ('W','A','S','D','C','E'):
+                            raise ValueError('Invalid or reserved key (W/A/S/D/C/E)')
+                    except ValueError as exc:
+                        self.log.appendPlainText('System: ' + str(exc))
                     else:
                         key = actor.operator_name + ':' + str(actor.skin_number)
                         self.room._animation_bindings.setdefault(key, {})[keyname] = {
-                            'animation': name, 'speed': speed, 'loop': loop}
+                            'clips': clips, 'loop': sequence_loop}
                         try:
                             _save_animation_bindings(self.room._animation_bindings)
-                            self.log.appendPlainText(f'System: {keyname} bound to {name} ({speed:g}x, '+('loop).' if loop else 'single).'))
+                            self.log.appendPlainText(f'System: {keyname} bound to ' +
+                                ' → '.join(x['name'] for x in clips) +
+                                (' (sequence loop).' if sequence_loop else ' (single sequence).'))
                         except OSError as error:
                             self.log.appendPlainText(f'System: Could not save binding: {error}')
             elif content == 'op list':
@@ -742,6 +777,14 @@ class SpineRoomView(RoomView):
             'true' if loop else 'false')) + ')'
         self._js_command(js, callback)
 
+    def display_sequence(self, names, speed=1.0, loop=False, callback=None):
+        if not names:
+            return
+        js = 'window.veliaDisplaySequence && window.veliaDisplaySequence(' + ','.join((
+            json.dumps(list(names), ensure_ascii=False), str(float(speed)),
+            'true' if loop else 'false')) + ')'
+        self._js_command(js, callback)
+
     def _request_setup(self):
         if not WEBENGINE_AVAILABLE:
             self._warning('Qt WebEngine is required: pip install PySide6-Addons')
@@ -818,7 +861,7 @@ class SpineRoomView(RoomView):
             bindings = self._animation_bindings.get(controlled.operator_name + ':' + str(controlled.skin_number), {})
             binding = bindings.get(keyname)
             if binding:
-                controlled.display_animation(binding['animation'], binding['speed'], binding['loop'])
+                controlled.display_sequence(binding.get('clips') or binding.get('animations', [binding['animation']] if 'animation' in binding else []), binding.get('speed', 1.0), binding.get('loop', False))
                 return True
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
         key = key_map.get(event.key())
@@ -1031,7 +1074,101 @@ window.veliaDisplayAnimation=function(name,speed,loop){
   }
   return 'System: Playing mov/'+name+' at '+speed+'x'+(loop?' (loop)':'');
 };
+window.veliaDisplaySequence=function(names,speed,loop){
+  if(!Array.isArray(names)||!names.length) return 'System: Empty animation sequence.';
+  const resolved=[];
+  for(const raw of names){
+    const input=typeof raw==='string'?{name:raw}:raw;
+    if(!input||typeof input.name!=='string') return 'System: Invalid animation binding.';
+    const name=input.name;
+    const prefix=/^(mov|perf)\\//i.exec(name);
+    const model=prefix?prefix[1].toLowerCase():null;
+    const asked=prefix?name.slice(prefix[0].length):name;
+    const match=(p)=>p&&p.skeleton.data.animations.find(a=>a.name.toLowerCase()===asked.toLowerCase());
+    const movMatch=match(veliaMovPlayer), perfMatch=match(null);
+    if(!model && movMatch && perfMatch) return 'System: Ambiguous animation: '+name;
+    const kind=model||(movMatch?'mov':perfMatch?'perf':null);
+    const clip=kind==='mov'?movMatch:kind==='perf'?perfMatch:null;
+    if(!clip) return 'System: Animation not found: '+name;
+    const partSpeed=Number(input.speed===undefined?speed:input.speed);
+    const flip=input.flip||'auto', play=input.play||'normal';
+    if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
+      return 'System: Invalid animation modifier for '+name;
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
+  }
+  if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
+  const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
+  token.cancel=function(){
+    token.active=false;
+    if(token.raf) cancelAnimationFrame(token.raf);
+    for(const item of token.listeners) item.state.removeListener(item.listener);
+    token.listeners=[];
+    for(const [canvas,transform] of token.transforms) canvas.style.transform=transform;
+    token.transforms.clear();
+  };
+  window.veliaSequenceToken=token;
+  let index=0;
+  function finish(){
+    if(!token.active) return;
+    if(index+1<resolved.length){index++;playNext();return;}
+    if(loop){index=0;playNext();return;}
+    token.cancel(); window.veliaSequenceToken=null;
+    interruptDisplay();
+  }
+  function playNext(){
+    if(!token.active)return;
+    for(const item of token.listeners)item.state.removeListener(item.listener);
+    token.listeners=[];
+    if(token.raf){cancelAnimationFrame(token.raf);token.raf=0;}
+    const current=resolved[index];
+    const result=window.veliaDisplayAnimation(current.name,current.speed,true);
+    if(typeof result==='string'&&!result.startsWith('System: Playing')){token.cancel();return;}
+    if(veliaDisplay && null) veliaDisplay.returnPerf=token.restorePerf;
+    const player=current.model==='perf'?null:veliaMovPlayer;
+    const canvas=document.querySelector('#'+current.model+' canvas');
+    if(canvas){
+      if(!token.transforms.has(canvas)) token.transforms.set(canvas,canvas.style.transform);
+      const original=token.transforms.get(canvas);
+      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:original.includes('scaleX(-1)');
+      const sx=current.flip==='left'?-1:current.flip==='right'?1:defaultLeft?-1:1;
+      const sy=current.flip==='down'?-1:1;
+      canvas.style.transform=current.flip==='auto'?original:'scale('+sx+','+sy+')';
+    }
+    const state=player.animationState;
+    const entry=state.getCurrent(0);
+    if(!entry){token.cancel();return;}
+    if(current.play==='backward'){
+      // Spine 3.8 does not support reverse track update. Sample trackTime
+      // backwards while keeping the built-in renderer and animation state alive.
+      const duration=entry.animation.duration;
+      const began=performance.now();
+      state.timeScale=0;
+      const tick=(now)=>{
+        if(!token.active||window.veliaSequenceToken!==token)return;
+        const elapsed=(now-began)/1000*files.motionSpeed*current.speed;
+        entry.trackTime=Math.max(0.00001,duration-elapsed);
+        if(elapsed>=duration){finish();return;}
+        token.raf=requestAnimationFrame(tick);
+      };
+      token.raf=requestAnimationFrame(tick);
+    }else{
+      const listener={complete:function(done){
+        if(!token.active||window.veliaSequenceToken!==token||done!==entry)return;
+        state.removeListener(listener);
+        token.listeners=token.listeners.filter(x=>x.listener!==listener);
+        finish();
+      }};
+      state.addListener(listener);
+      token.listeners.push({state:state,listener:listener});
+    }
+  }
+  playNext();
+  return 'System: Playing sequence: '+resolved.map(x=>x.name).join(' -> ');
+};
 function interruptDisplay(){
+  if(window.veliaSequenceToken){
+    window.veliaSequenceToken.cancel();
+  }
   if(!veliaDisplay) return;
   veliaDisplay=null;
   veliaMovPlayer.animationState.timeScale=files.motionSpeed;
@@ -1287,7 +1424,101 @@ window.veliaDisplayAnimation=function(name,speed,loop){
   document.getElementById('mov').style.visibility=model==='mov'?'visible':'hidden';
   return 'System: Playing '+model+'/'+clipName+' at '+speed+'x'+(loop?' (loop)':'');
 };
+window.veliaDisplaySequence=function(names,speed,loop){
+  if(!Array.isArray(names)||!names.length) return 'System: Empty animation sequence.';
+  const resolved=[];
+  for(const raw of names){
+    const input=typeof raw==='string'?{name:raw}:raw;
+    if(!input||typeof input.name!=='string') return 'System: Invalid animation binding.';
+    const name=input.name;
+    const prefix=/^(mov|perf)\\//i.exec(name);
+    const model=prefix?prefix[1].toLowerCase():null;
+    const asked=prefix?name.slice(prefix[0].length):name;
+    const match=(p)=>p&&p.skeleton.data.animations.find(a=>a.name.toLowerCase()===asked.toLowerCase());
+    const movMatch=match(movPlayer), perfMatch=match(perfPlayer);
+    if(!model && movMatch && perfMatch) return 'System: Ambiguous animation: '+name;
+    const kind=model||(movMatch?'mov':perfMatch?'perf':null);
+    const clip=kind==='mov'?movMatch:kind==='perf'?perfMatch:null;
+    if(!clip) return 'System: Animation not found: '+name;
+    const partSpeed=Number(input.speed===undefined?speed:input.speed);
+    const flip=input.flip||'auto', play=input.play||'normal';
+    if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
+      return 'System: Invalid animation modifier for '+name;
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
+  }
+  if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
+  const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
+  token.cancel=function(){
+    token.active=false;
+    if(token.raf) cancelAnimationFrame(token.raf);
+    for(const item of token.listeners) item.state.removeListener(item.listener);
+    token.listeners=[];
+    for(const [canvas,transform] of token.transforms) canvas.style.transform=transform;
+    token.transforms.clear();
+  };
+  window.veliaSequenceToken=token;
+  let index=0;
+  function finish(){
+    if(!token.active) return;
+    if(index+1<resolved.length){index++;playNext();return;}
+    if(loop){index=0;playNext();return;}
+    token.cancel(); window.veliaSequenceToken=null;
+    interruptDisplay();
+  }
+  function playNext(){
+    if(!token.active)return;
+    for(const item of token.listeners)item.state.removeListener(item.listener);
+    token.listeners=[];
+    if(token.raf){cancelAnimationFrame(token.raf);token.raf=0;}
+    const current=resolved[index];
+    const result=window.veliaDisplayAnimation(current.name,current.speed,true);
+    if(typeof result==='string'&&!result.startsWith('System: Playing')){token.cancel();return;}
+    if(veliaDisplay && perfPlayer) veliaDisplay.returnPerf=token.restorePerf;
+    const player=current.model==='perf'?perfPlayer:movPlayer;
+    const canvas=document.querySelector('#'+current.model+' canvas');
+    if(canvas){
+      if(!token.transforms.has(canvas)) token.transforms.set(canvas,canvas.style.transform);
+      const original=token.transforms.get(canvas);
+      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:original.includes('scaleX(-1)');
+      const sx=current.flip==='left'?-1:current.flip==='right'?1:defaultLeft?-1:1;
+      const sy=current.flip==='down'?-1:1;
+      canvas.style.transform=current.flip==='auto'?original:'scale('+sx+','+sy+')';
+    }
+    const state=player.animationState;
+    const entry=state.getCurrent(0);
+    if(!entry){token.cancel();return;}
+    if(current.play==='backward'){
+      // Spine 3.8 does not support reverse track update. Sample trackTime
+      // backwards while keeping the built-in renderer and animation state alive.
+      const duration=entry.animation.duration;
+      const began=performance.now();
+      state.timeScale=0;
+      const tick=(now)=>{
+        if(!token.active||window.veliaSequenceToken!==token)return;
+        const elapsed=(now-began)/1000*files.motionSpeed*current.speed;
+        entry.trackTime=Math.max(0.00001,duration-elapsed);
+        if(elapsed>=duration){finish();return;}
+        token.raf=requestAnimationFrame(tick);
+      };
+      token.raf=requestAnimationFrame(tick);
+    }else{
+      const listener={complete:function(done){
+        if(!token.active||window.veliaSequenceToken!==token||done!==entry)return;
+        state.removeListener(listener);
+        token.listeners=token.listeners.filter(x=>x.listener!==listener);
+        finish();
+      }};
+      state.addListener(listener);
+      token.listeners.push({state:state,listener:listener});
+    }
+  }
+  playNext();
+  return 'System: Playing sequence: '+resolved.map(x=>x.name).join(' -> ');
+};
 function interruptDisplay(){
+  if(window.veliaSequenceToken){
+    window.veliaSequenceToken.cancel();
+  }
   if(!veliaDisplay) return;
   const restorePerf=veliaDisplay.returnPerf;
   veliaDisplay=null;
