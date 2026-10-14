@@ -30,25 +30,86 @@ OPERATOR_HEIGHT_M = 1.70
 # PERForm/MOV asset dimensions may differ; camera normalization handles both.
 
 
-def load_operator(name):
-    """Find a generic operator's unique perf/mov skeleton pair."""
+def _model_directory(folder, prefix, skin_number=1):
+    """Resolve a numbered MOV/PERF directory, supporting optional $%$ labels."""
+    candidates = []
+    if not folder.is_dir():
+        return None
+    for item in folder.iterdir():
+        if not item.is_dir():
+            continue
+        head = item.name.split('$%$', 1)[0]
+        suffix = head[len(prefix):] if head.startswith(prefix) else None
+        if suffix is None:
+            continue
+        number = 1 if suffix == '' else int(suffix) if suffix.isdecimal() else None
+        if number == skin_number:
+            candidates.append(item)
+    # A duplicate model index is ambiguous; never choose a random model.
+    if len(candidates) > 1:
+        raise ValueError(f'Ambiguous {prefix} skin {skin_number} in {folder}')
+    return candidates[0] if candidates else None
+
+
+def _validated_model(path):
+    if path is None:
+        return None
+    skels = sorted(path.glob('*.skel'))
+    if len(skels) != 1:
+        raise FileNotFoundError(f'{path}: expected exactly one .skel file')
+    skel = skels[0]
+    atlas = skel.with_suffix('.atlas')
+    if not atlas.is_file():
+        raise FileNotFoundError(atlas)
+    lines = atlas.read_text(encoding='utf-8-sig').splitlines()
+    pages = [line.strip() for line in lines if line.strip().lower().endswith('.png')]
+    if not pages or any(not (path / page).is_file() for page in pages):
+        raise FileNotFoundError(f'{atlas}: missing referenced PNG texture page')
+    return skel, atlas
+
+
+def _skin_name(path):
+    return path.name.split('$%$', 1)[1].strip() if path and '$%$' in path.name else ''
+
+
+def operator_skins(name):
+    """Return {index: {'label','mov','perf'}} for available skins.
+
+    For the label prefer MOV metadata over PERF metadata. Default skin is 1.
+    A MOV skeleton is required; PERF is optional (MOV-only fallback).
+    """
     folder = OP_DIR / name
-    def lookup(model):
-        path = folder / model
-        skels = sorted(path.glob('*.skel'))
-        if len(skels) != 1:
-            raise FileNotFoundError(f'{path}: expected exactly one .skel file')
-        skel = skels[0]
-        atlas = skel.with_suffix('.atlas')
-        if not atlas.is_file():
-            raise FileNotFoundError(atlas)
-        # Atlas can point at a different PNG basename, so verify actual pages.
-        lines = atlas.read_text(encoding='utf-8-sig').splitlines()
-        pages = [line.strip() for line in lines if line.strip().lower().endswith('.png')]
-        if not pages or any(not (path / page).is_file() for page in pages):
-            raise FileNotFoundError(f'{atlas}: missing referenced .png texture page')
-        return skel, atlas
-    return lookup('perf'), lookup('mov')
+    if not folder.is_dir():
+        return {}
+    numbers = set()
+    for path in folder.iterdir():
+        if not path.is_dir():
+            continue
+        base = path.name.split('$%$', 1)[0]
+        if not base.startswith('mov'):
+            continue
+        rest = base[3:]
+        if rest == '' or rest.isdecimal():
+            numbers.add(int(rest) if rest else 1)
+    out = {}
+    for number in sorted(numbers):
+        mov = _model_directory(folder, 'mov', number)
+        perf = _model_directory(folder, 'perf', number)
+        if mov is None or len(list(mov.glob('*.skel'))) != 1:
+            continue
+        label = '默认皮肤' if number == 1 else (_skin_name(mov) or _skin_name(perf) or f'皮肤 {number}')
+        out[number] = {'label': label, 'mov': mov, 'perf': perf}
+    return out
+
+
+def load_operator(name, skin_number=1):
+    """Load the requested skin pair, falling back to MOV-only when no PERF exists."""
+    skin = operator_skins(name).get(skin_number)
+    if skin is None:
+        raise FileNotFoundError(f'{name}: skin {skin_number} does not exist')
+    mov = _validated_model(skin['mov'])
+    perf = _validated_model(skin['perf']) if skin['perf'] and name.casefold() != 'enya' else None
+    return perf, mov
 
 
 # Shared world scale for every operator: x/z 0..10 m, 1 tile = 1 m².
@@ -119,7 +180,7 @@ def available_operators():
     if not OP_DIR.is_dir():
         return []
     return sorted((folder.name for folder in OP_DIR.iterdir()
-                   if folder.is_dir() and len(list((folder / 'mov').glob('*.skel'))) == 1),
+                   if folder.is_dir() and 1 in operator_skins(folder.name)),
                   key=str.casefold)
 
 
@@ -189,6 +250,8 @@ class RoomConsole(QFrame):
                     '//oppick NAME — Control an operator already in the room.\n'
                     '//oplist — List all installed operators.\n'
                     '//oprelease — Release all operators from the room.\n'
+                    '//listskin — List skins for the controlled operator.\n'
+                    '//skinpick NUMBER — Switch the controlled operator to a skin.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
                 )
@@ -198,6 +261,26 @@ class RoomConsole(QFrame):
             elif content == 'wakeup':
                 self.room.controlled_actor().set_sleeping(False) if self.room.controlled_actor() else None
                 self.log.appendPlainText('System: Awake.')
+            elif content == 'listskin':
+                actor = self.room.controlled_actor()
+                if actor is None:
+                    self.log.appendPlainText('System: No operator is currently controlled.')
+                else:
+                    skins = operator_skins(actor.operator_name)
+                    self.log.appendPlainText('Available skins (' + actor.operator_name + '):\n' +
+                                             ('\n'.join(f'{idx}. {entry["label"]}' for idx, entry in skins.items())
+                                              or '(none)'))
+            elif content.startswith('skinpick'):
+                pieces = content.split()
+                actor = self.room.controlled_actor()
+                if len(pieces) != 2 or not pieces[1].isdecimal():
+                    self.log.appendPlainText('System: Usage //skinpick NUMBER')
+                elif actor is None:
+                    self.log.appendPlainText('System: No operator is currently controlled.')
+                elif actor.select_skin(int(pieces[1])):
+                    self.log.appendPlainText(f'System: {actor.operator_name} skin {pieces[1]} selected.')
+                else:
+                    self.log.appendPlainText('System: Skin unavailable or could not load.')
             elif content == 'oplist':
                 self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
             elif content == 'oprelease':
@@ -223,6 +306,7 @@ class SpineRoomView(RoomView):
     def __init__(self, parent=None, operator_name='Enya'):
         super().__init__(parent)
         self.operator_name = operator_name
+        self.skin_number = 1
         self.spawn_x, self.spawn_z = sample_spawn()
         self.overlay = None
         self.status = None
@@ -373,28 +457,41 @@ class SpineRoomView(RoomView):
         if z < 0: self._held_keys.add('w')
         if z > 0: self._held_keys.add('s')
 
+    def select_skin(self, skin_number):
+        """Switch a live actor's skeletons without moving its world position."""
+        if skin_number not in operator_skins(self.operator_name):
+            return False
+        if self.skin_number == skin_number:
+            return True
+        try:
+            # Resolve/validate first so an invalid skin keeps the current player.
+            load_operator(self.operator_name, skin_number)
+        except (OSError, ValueError) as error:
+            print('[Velia Spine] Skin selection failed:', error, flush=True)
+            return False
+        previous_overlay = self.overlay
+        self._ready_poll.stop()
+        self._ready = False
+        self._poll_count = 0
+        self._moving_animation = False
+        self._last_depth_scale = None
+        self.skin_number = skin_number
+        self.overlay = None
+        if previous_overlay is not None:
+            previous_overlay.stop()
+            previous_overlay.hide()
+            previous_overlay.deleteLater()
+        self._request_setup()
+        return self.overlay is not None
+
     def _request_setup(self):
         if not WEBENGINE_AVAILABLE:
             self._warning('Qt WebEngine is required: pip install PySide6-Addons')
             return
         try:
-            if self.operator_name.casefold() == 'enya':
-                # Enya is MOV-only: never inspect or load mismatched PERF assets.
-                mov_dir = OP_DIR / self.operator_name / 'mov'
-                mov_candidates = sorted(mov_dir.glob('*.skel'))
-                if len(mov_candidates) != 1:
-                    raise FileNotFoundError(f'{mov_dir}: expected exactly one .skel file')
-                mov = mov_candidates[0]
-                atlas = mov.with_suffix('.atlas')
-                if not atlas.is_file():
-                    raise FileNotFoundError(atlas)
-                atlas_pages = [line.strip() for line in atlas.read_text(encoding='utf-8-sig').splitlines()
-                               if line.strip().lower().endswith('.png')]
-                if not atlas_pages or any(not (mov_dir / page).is_file() for page in atlas_pages):
-                    raise FileNotFoundError(f'{atlas}: missing referenced PNG texture')
-                perf = None
-            else:
-                (perf, _), (mov, _) = load_operator(self.operator_name)
+            (perf_info, mov_info) = load_operator(self.operator_name, self.skin_number)
+            perf = perf_info[0] if perf_info else None
+            mov = mov_info[0]
             js = RUNTIME_DIR / 'spine-player.js'
             css = RUNTIME_DIR / 'spine-player.css'
             if not (js.is_file() and css.is_file()):
