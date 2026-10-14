@@ -3,11 +3,11 @@ import json
 import os
 import sys
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint
+from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint, QPointF
 from PySide6.QtGui import QFont, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
-    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog)
+    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog, QToolButton)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
 from room_view import wallpapers, ROOM_SIDE_M
 from operator_spine import SpineRoomView, available_operators
@@ -49,6 +49,47 @@ class AnimatedButton(QPushButton):
         self._anim.setStartValue(self.height())
         self._anim.setEndValue(height)
         self._anim.start()
+
+class RoundCloseButton(QToolButton):
+    """Self-painted square close button; unrelated to global QPushButton QSS."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dark = False
+        self.setObjectName("pickerClose")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(36, 36)
+        self.setAutoRaise(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setToolTip("")
+
+    def set_dark(self, dark):
+        self._dark = bool(dark)
+        self.update()
+
+    def paintEvent(self, event):
+        # QToolButton does not inherit the dialog's QPushButton min-height/padding.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        bounds = self.rect().adjusted(1, 1, -1, -1)
+        if self.isDown():
+            fill = QColor('#485262' if self._dark else '#dbe5f0')
+        elif self.underMouse():
+            fill = QColor('#343a45' if self._dark else '#edf1f6')
+        else:
+            fill = QColor('#242a33' if self._dark else '#edf2f8')
+        border = QColor('#454c58' if self._dark else '#cbd3df')
+        ink = QColor('#f4f5f7' if self._dark else '#19222e')
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(fill)
+        painter.drawRoundedRect(bounds, 10, 10)
+        painter.setPen(QPen(ink, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        center = self.rect().center()
+        x, y = center.x(), center.y()
+        painter.drawLine(x - 5, y - 5, x + 5, y + 5)
+        painter.drawLine(x + 5, y - 5, x - 5, y + 5)
+        painter.end()
+
 
 class RoundedComboBox(QComboBox):
     # Frameless popup avoids native Windows combo borders.
@@ -183,9 +224,8 @@ class OperatorPickerDialog(QDialog):
         heading = QLabel(title)
         heading.setObjectName('pickerTitle')
         title_bar.addWidget(heading, 1)
-        close_button = QPushButton('×')
-        close_button.setFixedSize(34, 34)
-        close_button.setToolTip('Close')
+        close_button = RoundCloseButton(self)
+        close_button.set_dark(dark)
         close_button.clicked.connect(self.reject)
         title_bar.addWidget(close_button)
         layout.addLayout(title_bar)

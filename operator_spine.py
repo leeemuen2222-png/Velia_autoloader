@@ -5,6 +5,7 @@ converting atlas textures into sprites. QtWebEngine is needed to render
 Spine 3.8 via the bundled official spine-player.js.
 """
 import json
+import re
 import random
 import math
 import time
@@ -26,6 +27,23 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent
 OP_DIR = ROOT / 'resource' / 'op'
 RUNTIME_DIR = ROOT / 'resource' / 'spine'
+BINDING_FILE = ROOT / 'local' / 'preferences' / 'operator_animation_keys.json'
+
+
+def _load_animation_bindings():
+    try:
+        obj = json.loads(BINDING_FILE.read_text(encoding='utf-8'))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_animation_bindings(data):
+    BINDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = BINDING_FILE.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    temp.replace(BINDING_FILE)
+
 OPERATOR_HEIGHT_M = 1.70
 # PERForm/MOV asset dimensions may differ; camera normalization handles both.
 
@@ -204,7 +222,7 @@ CONSOLE_COMMANDS = (
     '//releaseall', '//skin list', '//skin pick ', '//perfmode true',
     '//perfmode false', '//ani list', '//ani display ',
     '//command autocomplete true', '//command autocomplete false',
-    '//command off', '//command on',
+    '//command off', '//command on', '//ani alloc ',
 )
 
 
@@ -375,6 +393,8 @@ class RoomConsole(QFrame):
                     '//perfmode [true|false] — Toggle PERF idle and lower-body MOV blend.\n'
                     '//ani list — List MOV and PERF animation names.\n'
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
+                    '//ani alloc NAME [SPEED] [loop|single] KEY — Bind animation to key.\n'
+                    'E in PERF mode — Play Attack (or Attack_1) without stopping walking.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
                 )
@@ -445,6 +465,41 @@ class RoomConsole(QFrame):
                         self.log.appendPlainText('System: Usage //ani display NAME [SPEED>0] [loop]')
                     else:
                         actor.display_animation(name, speed, loop, self.log.appendPlainText)
+            elif content.startswith('ani alloc'):
+                args = content.split()
+                actor = self.room.controlled_actor()
+                if actor is None:
+                    self.log.appendPlainText('System: No controlled operator.')
+                elif len(args) < 4 or len(args) > 6:
+                    self.log.appendPlainText('System: Usage //ani alloc NAME [SPEED] [loop|single] KEY')
+                else:
+                    name, keyname = args[2], args[-1].upper()
+                    modifiers = args[3:-1]
+                    speed, loop, valid = 1.0, False, True
+                    for modifier in modifiers:
+                        if modifier in ('single', 'loop'):
+                            loop = modifier == 'loop'
+                        else:
+                            try:
+                                speed = float(modifier)
+                            except ValueError:
+                                valid = False
+                    # Avoid stealing text keys, movement, Console access and built-in attack.
+                    if not re.fullmatch(r'[A-Z0-9]|F(?:[1-9]|1[0-2])|SPACE', keyname) or keyname in ('W','A','S','D','C','E'):
+                        valid = False
+                    if not math.isfinite(speed) or speed <= 0:
+                        valid = False
+                    if not valid:
+                        self.log.appendPlainText('System: Invalid binding or reserved key (W/A/S/D/C/E).')
+                    else:
+                        key = actor.operator_name + ':' + str(actor.skin_number)
+                        self.room._animation_bindings.setdefault(key, {})[keyname] = {
+                            'animation': name, 'speed': speed, 'loop': loop}
+                        try:
+                            _save_animation_bindings(self.room._animation_bindings)
+                            self.log.appendPlainText(f'System: {keyname} bound to {name} ({speed:g}x, '+('loop).' if loop else 'single).'))
+                        except OSError as error:
+                            self.log.appendPlainText(f'System: Could not save binding: {error}')
             elif content == 'op list':
                 self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
             elif content == 'releaseall':
@@ -486,6 +541,7 @@ class SpineRoomView(RoomView):
         self._moving_animation = False
         self._sleeping = False
         self._perf_mode = False
+        self._animation_bindings = _load_animation_bindings()
         self._facing_left = False
         self._velocity_x = 0.0
         self._velocity_z = 0.0
@@ -674,6 +730,9 @@ class SpineRoomView(RoomView):
         self._js_command('window.veliaPerfMode && window.veliaPerfMode(' +
                          ('true' if enabled else 'false') + ')', callback)
 
+    def attack_perf(self):
+        self._js_command('window.veliaPerfAttack && window.veliaPerfAttack()')
+
     def list_animations(self, callback):
         self._js_command('window.veliaAnimationList && window.veliaAnimationList()', callback)
 
@@ -749,6 +808,18 @@ class SpineRoomView(RoomView):
         if self.console.isVisible() or controlled is None or controlled._sleeping or controlled._deploying:
             self._held_keys.clear()
             return super().eventFilter(obj, event)
+        if typ == QEvent.Type.KeyPress and not event.isAutoRepeat():
+            if event.key() == Qt.Key.Key_E and controlled._perf_mode:
+                controlled.attack_perf()
+                return True
+            keyname = ('SPACE' if event.key() == Qt.Key.Key_Space else
+                       (event.text().upper() if event.text() and len(event.text()) == 1 else
+                        ('F' + str(event.key()-Qt.Key.Key_F1+1) if Qt.Key.Key_F1 <= event.key() <= Qt.Key.Key_F12 else '')))
+            bindings = self._animation_bindings.get(controlled.operator_name + ':' + str(controlled.skin_number), {})
+            binding = bindings.get(keyname)
+            if binding:
+                controlled.display_animation(binding['animation'], binding['speed'], binding['loop'])
+                return True
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
         key = key_map.get(event.key())
         if key is None:
@@ -1039,6 +1110,7 @@ new spine.SpinePlayer('mov',Object.assign({},params,{
             'perfSkel':perf_skel,'perfAtlas':perf_atlas,
             'movSkel':mov_skel,'movAtlas':mov_atlas}.items()}
         conf['motionSpeed'] = speed_multiplier(self.operator_name)
+        conf['operatorName'] = self.operator_name
         lib_url = file_url(js)
         css_url = file_url(css)
         # The player bounds are normalized to the whole overlay, independent of
@@ -1067,6 +1139,10 @@ let requestedMotion=false, requestedLeft=false, lastMovAnim='Relax';
 let veliaSleeping=false, veliaInteracting=false;
 
 let veliaDisplay=null, perfMode=false, hybridInstalled=false;
+let perfAttack=false;
+const specialAngelina=files.operatorName==='Angelina_E';
+const perfIdleName=specialAngelina?'Skill_1_Idle':'Idle';
+const perfStartName=specialAngelina?'Start_2':'Start';
 let legPairs=[];
 let blendSamples=0;
 function isLeg(name){
@@ -1100,7 +1176,7 @@ function installLegBlend(){
   const original=skeleton.updateWorldTransform.bind(skeleton);
   let last=performance.now();
   skeleton.updateWorldTransform=function(){
-    if(perfMode && requestedMotion && !veliaDisplay && !veliaSleeping){
+    if(perfMode && requestedMotion && !specialAngelina && !veliaDisplay && !veliaSleeping){
       const now=performance.now(), dt=Math.min(.05,Math.max(0,(now-last)/1000));
       movPlayer.animationState.update(dt);
       movPlayer.animationState.apply(movPlayer.skeleton);
@@ -1117,13 +1193,13 @@ function installLegBlend(){
 }
 window.veliaPerfMode=function(enabled){
   if(!switched||!perfPlayer||!movPlayer) return 'System: PERF model unavailable or deploying.';
-  if(enabled && !perfPlayer.skeleton.data.findAnimation('Idle'))
+  if(enabled && !perfPlayer.skeleton.data.findAnimation(perfIdleName))
     return 'System: PERF/Idle animation not available.';
   legPairs=legMapping();
-  if(enabled && (!movPlayer.skeleton.data.findAnimation('Move')||!legPairs.length))
+  if(enabled && !specialAngelina && (!movPlayer.skeleton.data.findAnimation('Move')||!legPairs.length))
     return 'System: No compatible lower-body MOV bones; hybrid mode not enabled.';
   perfMode=!!enabled;
-  veliaDisplay=null;
+  veliaDisplay=null; perfAttack=false;
   installLegBlend();
   if(perfMode){
     // PERF/Default is a one-frame showcase pose and must NEVER be used as idle.
@@ -1131,7 +1207,7 @@ window.veliaPerfMode=function(enabled){
     // so the upper body animates even while the operator is standing still.
     perfPlayer.animationState.timeScale=files.motionSpeed;
     perfPlayer.animationState.clearTracks();
-    perfPlayer.animationState.setAnimation(0,'Idle',true);
+    perfPlayer.animationState.setAnimation(0,perfIdleName,true);
     movPlayer.animationState.setAnimation(0,'Move',true);
     if(perfPlayer.play) perfPlayer.play();
     if(movPlayer.pause) movPlayer.pause();
@@ -1146,6 +1222,37 @@ window.veliaPerfMode=function(enabled){
     document.getElementById('mov').style.visibility='visible';
   }
   return 'System: PERF mode '+(perfMode?'enabled ('+legPairs.length+' mapped lower-body bones including hip and leg helpers)':'disabled')+'.';
+};
+// PERF attack runs on the PERF skeleton; MOV Move keeps driving leg bones.
+// Never reset this track when movement changes.
+window.veliaPerfAttack=function(){
+  if(!perfMode || !switched || !perfPlayer || perfAttack || veliaSleeping || veliaDisplay)
+    return 'System: PERF attack is currently unavailable.';
+  const state=perfPlayer.animationState;
+  const animations=perfPlayer.skeleton.data.animations || [];
+  const clip=animations.find(a=>a.name.toLowerCase()==='attack') ||
+             animations.find(a=>a.name.toLowerCase()==='attack_1');
+  if(!clip) return 'System: PERF has no Attack or Attack_1 animation.';
+  perfAttack=true;
+  const active=state.setAnimation(0,clip.name,false);
+  state.addAnimation(0,perfIdleName,true,0);
+  if(perfPlayer.play) perfPlayer.play();
+  const listener={
+    complete:function(entry){
+      if(entry===active){
+        perfAttack=false;
+        if(state.removeListener) state.removeListener(listener);
+      }
+    },
+    interrupt:function(entry){
+      if(entry===active){
+        perfAttack=false;
+        if(state.removeListener) state.removeListener(listener);
+      }
+    }
+  };
+  state.addListener(listener);
+  return 'System: Playing PERF/'+clip.name+'.';
 };
 window.veliaAnimationList=function(){
   const part=(label,p)=>label+'/\\n'+(p?p.skeleton.data.animations.map(a=>'  ├─ '+a.name).join('\\n'):'  (unavailable)');
@@ -1288,12 +1395,13 @@ function showRelax(){
 function readyPerf(player){
   perfPlayer=player;
   player.animationState.timeScale=files.motionSpeed;
-  const clip=player.skeleton.data.findAnimation('Start');
+  const clip=player.skeleton.data.findAnimation(perfStartName);
   if(!clip){console.error('Missing perf Start animation');document.title='VELIA_SPINE_ERROR';return;}
-  player.animationState.clearTracks();
+  // Keep the initial Start track installed while MOV and the camera load.
+  // The Spine 3.8 player render loop expects a non-null current entry.
   player.animationState.timeScale=0;
   player.animationState.addListener({complete:function(entry){
-    if(entry.animation && entry.animation.name==='Start'){
+    if(entry.animation && entry.animation.name===perfStartName){
       startComplete=true;
       showRelax();
     }
@@ -1308,14 +1416,13 @@ function maybeStartPerf(){
   perfStarted=true;
   applySharedCamera(perfPlayer);
   // Begin PERF only when the MOV-based camera is available.
-  perfPlayer.animationState.clearTracks();
-  perfPlayer.animationState.setAnimation(0,'Start',false);
+  perfPlayer.animationState.setAnimation(0,perfStartName,false);
   perfPlayer.animationState.timeScale=files.motionSpeed;
   perfPlayer.animationState.apply(perfPlayer.skeleton);
   setTimeout(()=>{document.title='VELIA_SPINE_READY';},120);
 }
 new spine.SpinePlayer('perf',Object.assign({},params,{
-  skelUrl:files.perfSkel,atlasUrl:files.perfAtlas,animation:'Start',
+  skelUrl:files.perfSkel,atlasUrl:files.perfAtlas,animation:perfStartName,
   success:readyPerf,
   error:function(p,msg){console.error('PERF/Start',msg);document.title='VELIA_SPINE_ERROR';}
 }));

@@ -1,0 +1,19 @@
+{
+  "Angelina:1": {
+    "K": {
+      "animation": "start",
+      "speed": 2.0,
+      "loop": false
+    },
+    "L": {
+      "animation": "attack",
+      "speed": 1.0,
+      "loop": false
+    },
+    "R": {
+      "animation": "attack",
+      "speed": 5.0,
+      "loop": false
+    }
+  }
+}
