@@ -226,7 +226,7 @@ def parse_alloc_animation(token):
     match = _ANIM_MODIFIERS.fullmatch(token)
     if not match:
         raise ValueError('Invalid animation/modifier syntax: ' + token)
-    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal', 'loop': False}
+    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal', 'loop': False, 'frame': None}
     if match.group('mods') is not None:
         if not match.group('mods').strip():
             return item
@@ -235,7 +235,7 @@ def parse_alloc_animation(token):
             if '=' not in part:
                 raise ValueError('Expected key=value in modifier: ' + part)
             key, value = (piece.strip().lower() for piece in part.split('=', 1))
-            if key in used or key not in ('speed', 'flip', 'play', 'loop'):
+            if key in used or key not in ('speed', 'flip', 'play', 'loop', 'frame'):
                 raise ValueError('Unknown or duplicate animation modifier: ' + key)
             used.add(key)
             if key == 'speed':
@@ -249,6 +249,13 @@ def parse_alloc_animation(token):
                 raise ValueError('flip must be auto/up/down/left/right')
             elif key == 'play' and value not in ('normal','backward'):
                 raise ValueError('play must be normal/backward')
+            elif key == 'frame':
+                if not re.fullmatch(r'\d+:\d+', value):
+                    raise ValueError('frame must be START:END')
+                start, end = map(int, value.split(':'))
+                if end <= start:
+                    raise ValueError('frame end must be greater than start')
+                value = [start, end]
             elif key == 'loop':
                 if value not in ('true', 'false'):
                     raise ValueError('loop must be true/false')
@@ -259,7 +266,7 @@ def parse_alloc_animation(token):
 
 CONSOLE_COMMANDS = (
     '//help', '//op sleep', '//op wake', '//op seize ', '//op list',
-    '//releaseall', '//skin list', '//skin pick ', '//perfmode true',
+    '//release', '//release all', '//release ', '//op add ', '//skin list', '//skin pick ', '//perfmode true',
     '//perfmode false', '//ani list', '//ani display ',
     '//command autocomplete true', '//command autocomplete false',
     '//command off', '//command on', '//ani alloc ', '//ani clearalloc',
@@ -427,7 +434,8 @@ class RoomConsole(QFrame):
                     '//op wake — Exit sleep mode and resume movement and Relax.\n'
                     '//op seize NAME — Control an operator already in the room.\n'
                     '//op list — List all installed operators.\n'
-                    '//releaseall — Release all operators from the room.\n'
+                    '//op add NAME — Add an operator, duplicates allowed.\n'
+                    '//release [all|NAME] — Omit argument to release all; NAME releases one instance.\n'
                     '//skin list — List skins for the controlled operator.\n'
                     '//skin pick NUMBER — Switch the controlled operator to a skin.\n'
                     '//perfmode [true|false] — Toggle PERF idle and lower-body MOV blend.\n'
@@ -435,7 +443,7 @@ class RoomConsole(QFrame):
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
                     '//ani alloc ANIMATION{modifiers} [...] KEY — Bind an animation sequence to a key.\n'
                     '//ani clearalloc — Remove all custom animation key bindings.\n'
-                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward,loop=true|false}; fields in any order; auto faces with operator.\n'
+                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward,loop=true|false,frame=START:END}; fields in any order; auto faces with operator.\n'
                     'E in PERF mode — Play Attack (or Attack_1) without stopping walking.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
@@ -506,7 +514,14 @@ class RoomConsole(QFrame):
                     if not name or not math.isfinite(speed) or speed <= 0:
                         self.log.appendPlainText('System: Usage //ani display NAME [SPEED>0] [loop]')
                     else:
-                        actor.display_animation(name, speed, loop, self.log.appendPlainText)
+                        if '{' in name:
+                            try:
+                                clip = parse_alloc_animation(name)
+                                actor.display_sequence([clip], speed, loop or clip['loop'], self.log.appendPlainText)
+                            except ValueError as error:
+                                self.log.appendPlainText('System: ' + str(error))
+                        else:
+                            actor.display_animation(name, speed, loop, self.log.appendPlainText)
             elif content == 'ani clearalloc':
                 self.room._animation_bindings.clear()
                 try:
@@ -549,9 +564,23 @@ class RoomConsole(QFrame):
                             self.log.appendPlainText(f'System: Could not save binding: {error}')
             elif content == 'op list':
                 self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
-            elif content == 'releaseall':
-                self.room.release_all()
-                self.log.appendPlainText('System: All operators released.')
+            elif content.split(maxsplit=1)[0] == 'release':
+                # //release and //release all are the same command.  A name
+                # releases one instance, even when duplicates are deployed.
+                target = content.partition(' ')[2].strip()
+                if not target or target == 'all':
+                    self.room.release_all()
+                    self.log.appendPlainText('System: All operators released.')
+                elif self.room.release_operator(target):
+                    self.log.appendPlainText('System: Released one instance of ' + target + '.')
+                else:
+                    self.log.appendPlainText('System: Operator not present: ' + target)
+            elif content.startswith('op add '):
+                name = content[len('op add '):].strip()
+                if self.room.add_operator(name, allow_duplicate=True):
+                    self.log.appendPlainText('System: Added ' + name + '.')
+                else:
+                    self.log.appendPlainText('System: Operator resource unavailable: ' + name)
             elif content.startswith('op seize '):
                 target = content[len('op seize '):].strip()
                 if self.room.pick_operator(target):
@@ -647,9 +676,9 @@ class SpineRoomView(RoomView):
             return self
         return self._actors.get(self._control_name)
 
-    def add_operator(self, name):
+    def add_operator(self, name, allow_duplicate=False):
         canonical = next((n for n in available_operators() if n.casefold() == name.casefold()), None)
-        if not canonical or canonical == self.operator_name or canonical in self._actors:
+        if not canonical or (not allow_duplicate and canonical in self.placed_operator_names()):
             return False
         if self.operator_name is None:
             self.operator_name = canonical
@@ -667,31 +696,75 @@ class SpineRoomView(RoomView):
             actor._is_npc = True
             actor.setGeometry(self.rect())
             actor.show()
-            self._actors[canonical] = actor
+            key = canonical
+            index = 2
+            while key in self._actors or key == self.operator_name:
+                key = f'{canonical}#{index}'
+                index += 1
+            self._actors[key] = actor
         self._keep_console_on_top()
         self.controlledChanged.emit()
         return True
 
     def pick_operator(self, name):
         name = name.casefold().strip()
-        available = {n.casefold(): n for n in self.placed_operator_names()}
-        if name not in available:
+        possible = ([self.operator_name] if self.operator_name else []) + list(self._actors)
+        matches = [key for key in possible if key and (key.casefold() == name or key.split('#')[0].casefold() == name)]
+        if not matches:
             return False
-        chosen = available[name]
+        chosen = random.choice(matches)
         for old in ([self] if self.operator_name else []) + list(self._actors.values()):
-            if old.operator_name != chosen and old._perf_mode:
+            if old is not (self if chosen == self.operator_name else self._actors.get(chosen)) and old._perf_mode:
                 old.set_perf_mode(False)
         self._control_name = chosen
         self._is_npc = chosen != self.operator_name
         self._held_keys.clear()
         for actor in self._actors.values():
             actor._held_keys.clear()
-            actor._is_npc = actor.operator_name != chosen
+            actor._is_npc = actor is not self._actors.get(chosen)
         self.controlledChanged.emit()
         return True
 
     def placed_operator_names(self):
-        return ([self.operator_name] if self.operator_name else []) + list(self._actors)
+        return ([self.operator_name] if self.operator_name else []) + [a.operator_name for a in self._actors.values()]
+
+    def release_operator(self, name):
+        name = name.casefold().strip()
+        keys = [key for key in self._actors if key.casefold() == name or key.split('#')[0].casefold() == name]
+        if keys:
+            key = random.choice(keys)
+            actor = self._actors.pop(key)
+            actor.close()
+            actor.setParent(None)
+            actor.deleteLater()
+            if self._control_name == key:
+                self._control_name = self.operator_name or next(iter(self._actors), None)
+                self._is_npc = self._control_name is not None and self._control_name != self.operator_name
+                for other_key, other_actor in self._actors.items():
+                    other_actor._is_npc = other_key != self._control_name
+            self._keep_console_on_top()
+            self.controlledChanged.emit()
+            return True
+        if self.operator_name and self.operator_name.casefold() == name:
+            # The room canvas is the original actor. Recreate it empty and
+            # retain the other operators as independent child layers.
+            if self.overlay:
+                self.overlay.stop()
+                self.overlay.deleteLater()
+                self.overlay = None
+            self._ready_poll.stop()
+            was_controlled = self._control_name == self.operator_name
+            self.operator_name = None
+            self._ready = False
+            self._held_keys.clear()
+            if was_controlled:
+                self._control_name = next(iter(self._actors), None)
+            self._is_npc = self._control_name is not None
+            for key, actor in self._actors.items():
+                actor._is_npc = key != self._control_name
+            self.controlledChanged.emit()
+            return True
+        return False
 
     def release_all(self):
         for actor in list(self._actors.values()):
@@ -1111,10 +1184,12 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(!clip) return 'System: Animation not found: '+name;
     const partSpeed=Number(input.speed===undefined?speed:input.speed);
     const flip=input.flip||'auto', play=input.play||'normal';
+    const frame=input.frame===undefined||input.frame===null?null:input.frame;
+    if(frame && (!Array.isArray(frame)||frame.length!==2||!Number.isInteger(frame[0])||!Number.isInteger(frame[1])||frame[0]<0||frame[1]<=frame[0])) return 'System: Invalid frame range for '+name;
     if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
-    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame});
   }
   if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
   const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
@@ -1157,7 +1232,23 @@ window.veliaDisplaySequence=function(names,speed,loop){
     const state=player.animationState;
     const entry=state.getCurrent(0);
     if(!entry){token.cancel();return;}
-    if(current.play==='backward'){
+    if(current.frame){
+      const start=current.frame[0]/30, end=current.frame[1]/30;
+      const duration=entry.animation.duration;
+      if(start>=duration||end>duration+0.00001){token.cancel();window.veliaSequenceToken=null;interruptDisplay();return;}
+      const began=performance.now();
+      state.timeScale=0;
+      const tick=(now)=>{
+        if(!token.active||window.veliaSequenceToken!==token)return;
+        const elapsed=(now-began)/1000*files.motionSpeed*current.speed;
+        const t=current.play==='backward'?end-elapsed:start+elapsed;
+        entry.trackTime=Math.max(0.000001,Math.min(duration-0.000001,t));
+        if(elapsed>=end-start){finish();return;}
+        token.raf=requestAnimationFrame(tick);
+      };
+      entry.trackTime=current.play==='backward'?end:start;
+      token.raf=requestAnimationFrame(tick);
+    }else if(current.play==='backward'){
       // Spine 3.8 does not support reverse track update. Sample trackTime
       // backwards while keeping the built-in renderer and animation state alive.
       const duration=entry.animation.duration;
@@ -1468,10 +1559,12 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(!clip) return 'System: Animation not found: '+name;
     const partSpeed=Number(input.speed===undefined?speed:input.speed);
     const flip=input.flip||'auto', play=input.play||'normal';
+    const frame=input.frame===undefined||input.frame===null?null:input.frame;
+    if(frame && (!Array.isArray(frame)||frame.length!==2||!Number.isInteger(frame[0])||!Number.isInteger(frame[1])||frame[0]<0||frame[1]<=frame[0])) return 'System: Invalid frame range for '+name;
     if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
-    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame});
   }
   if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
   const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
@@ -1514,7 +1607,23 @@ window.veliaDisplaySequence=function(names,speed,loop){
     const state=player.animationState;
     const entry=state.getCurrent(0);
     if(!entry){token.cancel();return;}
-    if(current.play==='backward'){
+    if(current.frame){
+      const start=current.frame[0]/30, end=current.frame[1]/30;
+      const duration=entry.animation.duration;
+      if(start>=duration||end>duration+0.00001){token.cancel();window.veliaSequenceToken=null;interruptDisplay();return;}
+      const began=performance.now();
+      state.timeScale=0;
+      const tick=(now)=>{
+        if(!token.active||window.veliaSequenceToken!==token)return;
+        const elapsed=(now-began)/1000*files.motionSpeed*current.speed;
+        const t=current.play==='backward'?end-elapsed:start+elapsed;
+        entry.trackTime=Math.max(0.000001,Math.min(duration-0.000001,t));
+        if(elapsed>=end-start){finish();return;}
+        token.raf=requestAnimationFrame(tick);
+      };
+      entry.trackTime=current.play==='backward'?end:start;
+      token.raf=requestAnimationFrame(tick);
+    }else if(current.play==='backward'){
       // Spine 3.8 does not support reverse track update. Sample trackTime
       // backwards while keeping the built-in renderer and animation state alive.
       const duration=entry.animation.duration;

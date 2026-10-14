@@ -289,17 +289,17 @@ class OperatorCard(AnimatedButton):
         super().__init__('', parent)
         self.name = name
         self.setObjectName('operatorCard')
-        self.setMinimumHeight(204)
-        self.setMaximumHeight(204)
+        self.setMinimumHeight(162)
+        self.setMaximumHeight(162)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet('')
         self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(14, 10, 14, 10)
-        self._layout.setSpacing(10)
+        self._layout.setContentsMargins(9, 6, 9, 6)
+        self._layout.setSpacing(6)
         left = QVBoxLayout()
-        left.setSpacing(5)
+        left.setSpacing(2)
         portrait = QLabel()
-        portrait.setFixedSize(108, 112)
+        portrait.setFixedSize(58, 61)
         portrait.setAlignment(Qt.AlignmentFlag.AlignCenter)
         portrait.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         portrait.setObjectName('portrait')
@@ -308,7 +308,7 @@ class OperatorCard(AnimatedButton):
         if portrait_file.is_file():
             pix = QPixmap(str(portrait_file))
             if not pix.isNull():
-                portrait.setPixmap(pix.scaled(108, 112, Qt.AspectRatioMode.KeepAspectRatio,
+                portrait.setPixmap(pix.scaled(58, 61, Qt.AspectRatioMode.KeepAspectRatio,
                                              Qt.TransformationMode.SmoothTransformation))
             else:
                 portrait.setText('OP')
@@ -325,8 +325,8 @@ class OperatorCard(AnimatedButton):
         self.preview_placeholder = QLabel('MOV / Relax')
         self.preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.preview_placeholder.setMinimumSize(170, 138)
-        self.preview_placeholder.setMaximumHeight(138)
+        self.preview_placeholder.setMinimumSize(85, 82)
+        self.preview_placeholder.setMaximumHeight(82)
         self.preview_placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._layout.addWidget(self.preview_placeholder)
 
@@ -348,7 +348,7 @@ new spine.SpinePlayer('preview',{skelUrl:c.skel,atlasUrl:c.atlas,animation:'Rela
 showControls:false,alpha:true,backgroundColor:'#00000000',premultipliedAlpha:true,
 showLoading:false,success:function(player){const o=new spine.Vector2(),z=new spine.Vector2();
 player.skeleton.updateWorldTransform();player.skeleton.getBounds(o,z);
-const h=Math.max(z.y/0.80,z.x/1.7)*1.25;
+const h=Math.max(z.y/0.80,z.x/1.7)*0.625;
 player.currentViewport={x:o.x+z.x/2-h*0.9,y:o.y-h*0.12,width:h*1.8,height:h,padLeft:0,padRight:0,padTop:0,padBottom:0};
 player.previousViewport=null;}});
 </script></body></html>''' % (playercss, playerjs, settings)
@@ -358,8 +358,8 @@ player.previousViewport=null;}});
                 self.preview.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
                 self.preview.page().setBackgroundColor(QColor(0,0,0,0))
                 self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,True)
-                self.preview.setMinimumSize(170,138)
-                self.preview.setMaximumHeight(138)
+                self.preview.setMinimumSize(85,82)
+                self.preview.setMaximumHeight(82)
                 self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 self.preview.setHtml(html,QUrl.fromLocalFile(str(ROOT)+'/'))
                 self._layout.replaceWidget(self.preview_placeholder, self.preview)
@@ -511,11 +511,15 @@ class MainWindow(QMainWindow):
         self.chooser_content = QWidget()
         self.chooser_content.setObjectName('operatorChooserContent')
         self.chooser_items = QGridLayout(self.chooser_content)
+        # Keep short rows packed at the top instead of spreading them across the tall viewport.
+        self.chooser_items.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.chooser_items.setContentsMargins(10, 10, 10, 10)
         self.chooser_items.setHorizontalSpacing(14)
         self.chooser_items.setVerticalSpacing(14)
         self.chooser_items.setColumnStretch(0, 1)
         self.chooser_items.setColumnStretch(1, 1)
+        self.chooser_items.setColumnStretch(2, 1)
+        self.chooser_items.setColumnStretch(3, 1)
         self.chooser_scroll.setWidget(self.chooser_content)
         op_layout.addWidget(self.chooser_scroll,1)
         self._operator_cards = []
@@ -633,7 +637,7 @@ class MainWindow(QMainWindow):
         for idx, name in enumerate(available):
             card = OperatorCard(name,dark,self.chooser_content)
             card.clicked.connect(lambda checked=False, selected=name: self._select_operator_card(selected))
-            self.chooser_items.addWidget(card, idx // 2, idx % 2)
+            self.chooser_items.addWidget(card, idx // 4, idx % 4)
             self._operator_cards.append(card)
         self._pending_previews = list(self._operator_cards)
         self.operator_search.clear()
@@ -658,7 +662,7 @@ class MainWindow(QMainWindow):
                 continue
             self.chooser_items.addWidget(card, row, col)
             col += 1
-            if col == 2:
+            if col == 4:
                 col = 0
                 row += 1
 
@@ -821,7 +825,8 @@ class MainWindow(QMainWindow):
         QPushButton#operatorCard {{background:{panel};border:1px solid {border};border-radius:16px;padding:0;text-align:left;}}
         QPushButton#operatorCard:hover {{background:{hover};border-color:{muted};}}
         QPushButton#operatorCard:pressed {{background:{active};border-color:{text};padding:0;}}
-        QLabel#portrait {{background:{hover};border:1px solid {border};border-radius:12px;}}
+        QLabel#portrait {{background:{hover};border:1px solid {border};border-radius:9px;}}
+        QPushButton#operatorCard QLabel {{font-size:11px;}}
         """)
 
     def _change_theme(self):
