@@ -209,26 +209,23 @@ CONSOLE_COMMANDS = (
 
 
 class CommandLineEdit(QLineEdit):
-    """Console input with completion and PageUp/PageDown command history."""
+    """Console input with Enter completion and PageUp/PageDown command history."""
     def __init__(self, console):
         super().__init__(console)
         self.console = console
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key == Qt.Key.Key_PageUp and self.text().startswith('//'):
+        if key == Qt.Key.Key_PageUp:
             self.console._history_step(-1)
             event.accept()
             return
-        if key == Qt.Key.Key_PageDown and self.text().startswith('//'):
+        if key == Qt.Key.Key_PageDown:
             self.console._history_step(1)
             event.accept()
             return
-        if key == Qt.Key.Key_Tab and self.console._accept_completion():
-            event.accept()
-            return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if self.console._accept_completion():
+            if not self.console._history_recalled and self.console._accept_completion():
                 event.accept()
                 return
             self.console._submit()
@@ -248,6 +245,7 @@ class RoomConsole(QFrame):
         self._history_index = None
         self._history_draft = ''
         self._completion = None
+        self._history_recalled = False
         self.setObjectName('roomConsole')
         self.setStyleSheet("""
             QFrame#roomConsole { background: rgba(0, 0, 0, 145);
@@ -277,6 +275,7 @@ class RoomConsole(QFrame):
         self.edit = CommandLineEdit(self)
         self.edit.setPlaceholderText('type a command or message use //help to see a list of command')
         self.edit.textChanged.connect(self._on_input_changed)
+        self.edit.textEdited.connect(self._reset_history_browse)
         line.addWidget(self.edit, 1)
         layout.addLayout(line)
         self.hide()
@@ -293,7 +292,7 @@ class RoomConsole(QFrame):
             self.suggestion.hide()
             return
         self._completion = candidate
-        self.suggestion.setText('TAB / ENTER  →  ' + candidate)
+        self.suggestion.setText('ENTER  →  ' + candidate)
         self.suggestion.show()
 
     def _accept_completion(self):
@@ -301,13 +300,23 @@ class RoomConsole(QFrame):
             return False
         target = self._completion
         self.edit.setText(target)
+        self._history_recalled = False
         self.edit.setCursorPosition(len(target))
         # A completed command is executed on the next Enter; never execute it
         # merely because an autocomplete suggestion was accepted.
         return True
 
+    def _reset_history_browse(self, _value):
+        # Only actual user edits reset navigation; setText() during history
+        # traversal must not reset the index.
+        self._history_index = None
+        self._history_draft = ''
+        self._history_recalled = False
+
     def _history_step(self, direction):
         if not self._history:
+            self.suggestion.setText('No command history yet.')
+            self.suggestion.show()
             return
         if self._history_index is None:
             self._history_draft = self.edit.text()
@@ -317,12 +326,14 @@ class RoomConsole(QFrame):
                  else self._history[self._history_index])
         self.edit.setText(value)
         self.edit.setCursorPosition(len(value))
+        self._history_recalled = self._history_index != len(self._history)
 
     def _submit(self):
         raw = self.edit.text()
         self.edit.clear()
         self._history_index = None
         self._history_draft = ''
+        self._history_recalled = False
         kind, content = parse_console_entry(raw)
         if kind == 'empty':
             return
