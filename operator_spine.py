@@ -226,7 +226,7 @@ def parse_alloc_animation(token):
     match = _ANIM_MODIFIERS.fullmatch(token)
     if not match:
         raise ValueError('Invalid animation/modifier syntax: ' + token)
-    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal'}
+    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal', 'loop': False}
     if match.group('mods') is not None:
         if not match.group('mods').strip():
             return item
@@ -235,7 +235,7 @@ def parse_alloc_animation(token):
             if '=' not in part:
                 raise ValueError('Expected key=value in modifier: ' + part)
             key, value = (piece.strip().lower() for piece in part.split('=', 1))
-            if key in used or key not in ('speed', 'flip', 'play'):
+            if key in used or key not in ('speed', 'flip', 'play', 'loop'):
                 raise ValueError('Unknown or duplicate animation modifier: ' + key)
             used.add(key)
             if key == 'speed':
@@ -249,6 +249,10 @@ def parse_alloc_animation(token):
                 raise ValueError('flip must be auto/up/down/left/right')
             elif key == 'play' and value not in ('normal','backward'):
                 raise ValueError('play must be normal/backward')
+            elif key == 'loop':
+                if value not in ('true', 'false'):
+                    raise ValueError('loop must be true/false')
+                value = value == 'true'
             item[key] = value
     return item
 
@@ -258,7 +262,7 @@ CONSOLE_COMMANDS = (
     '//releaseall', '//skin list', '//skin pick ', '//perfmode true',
     '//perfmode false', '//ani list', '//ani display ',
     '//command autocomplete true', '//command autocomplete false',
-    '//command off', '//command on', '//ani alloc ',
+    '//command off', '//command on', '//ani alloc ', '//ani clearalloc',
 )
 
 
@@ -430,7 +434,8 @@ class RoomConsole(QFrame):
                     '//ani list — List MOV and PERF animation names.\n'
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
                     '//ani alloc ANIMATION{modifiers} [...] KEY — Bind an animation sequence to a key.\n'
-                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward} (optional after any animation).\n'
+                    '//ani clearalloc — Remove all custom animation key bindings.\n'
+                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward,loop=true|false}; fields in any order; auto faces with operator.\n'
                     'E in PERF mode — Play Attack (or Attack_1) without stopping walking.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
@@ -502,6 +507,13 @@ class RoomConsole(QFrame):
                         self.log.appendPlainText('System: Usage //ani display NAME [SPEED>0] [loop]')
                     else:
                         actor.display_animation(name, speed, loop, self.log.appendPlainText)
+            elif content == 'ani clearalloc':
+                self.room._animation_bindings.clear()
+                try:
+                    _save_animation_bindings(self.room._animation_bindings)
+                    self.log.appendPlainText('System: All animation allocations cleared.')
+                except OSError as error:
+                    self.log.appendPlainText(f'System: Bindings cleared in memory but save failed: {error}')
             elif content.startswith('ani alloc'):
                 args = content.split()
                 actor = self.room.controlled_actor()
@@ -527,7 +539,7 @@ class RoomConsole(QFrame):
                     else:
                         key = actor.operator_name + ':' + str(actor.skin_number)
                         self.room._animation_bindings.setdefault(key, {})[keyname] = {
-                            'clips': clips, 'loop': sequence_loop}
+                            'clips': clips, 'loop': sequence_loop or any(c['loop'] for c in clips)}
                         try:
                             _save_animation_bindings(self.room._animation_bindings)
                             self.log.appendPlainText(f'System: {keyname} bound to ' +
@@ -861,7 +873,14 @@ class SpineRoomView(RoomView):
             bindings = self._animation_bindings.get(controlled.operator_name + ':' + str(controlled.skin_number), {})
             binding = bindings.get(keyname)
             if binding:
-                controlled.display_sequence(binding.get('clips') or binding.get('animations', [binding['animation']] if 'animation' in binding else []), binding.get('speed', 1.0), binding.get('loop', False))
+                clips = binding.get('clips') or binding.get('animations', [binding['animation']] if 'animation' in binding else [])
+                looping = bool(binding.get('loop', False)) or any(isinstance(c, dict) and c.get('loop', False) for c in clips)
+                if looping and getattr(controlled, '_active_alloc_key', None) == keyname:
+                    controlled._active_alloc_key = None
+                    controlled._js_command('window.veliaStopSequence && window.veliaStopSequence()')
+                else:
+                    controlled._active_alloc_key = keyname if looping else None
+                    controlled.display_sequence(clips, binding.get('speed', 1.0), looping)
                 return True
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
         key = key_map.get(event.key())
@@ -1092,6 +1111,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(!clip) return 'System: Animation not found: '+name;
     const partSpeed=Number(input.speed===undefined?speed:input.speed);
     const flip=input.flip||'auto', play=input.play||'normal';
+    if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
     resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
@@ -1129,10 +1149,10 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(canvas){
       if(!token.transforms.has(canvas)) token.transforms.set(canvas,canvas.style.transform);
       const original=token.transforms.get(canvas);
-      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:original.includes('scaleX(-1)');
+      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:/scaleX\\(-1\\)|scale\\(-1[,)]/.test(original);
       const sx=current.flip==='left'?-1:current.flip==='right'?1:defaultLeft?-1:1;
       const sy=current.flip==='down'?-1:1;
-      canvas.style.transform=current.flip==='auto'?original:'scale('+sx+','+sy+')';
+      canvas.style.transform='scale('+sx+','+sy+')';
     }
     const state=player.animationState;
     const entry=state.getCurrent(0);
@@ -1165,9 +1185,15 @@ window.veliaDisplaySequence=function(names,speed,loop){
   playNext();
   return 'System: Playing sequence: '+resolved.map(x=>x.name).join(' -> ');
 };
+window.veliaStopSequence=function(){
+  if(!window.veliaSequenceToken || !window.veliaSequenceToken.active) return 'System: No active sequence.';
+  interruptDisplay();
+  return 'System: Animation sequence stopped.';
+};
 function interruptDisplay(){
   if(window.veliaSequenceToken){
     window.veliaSequenceToken.cancel();
+    window.veliaSequenceToken=null;
   }
   if(!veliaDisplay) return;
   veliaDisplay=null;
@@ -1442,6 +1468,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(!clip) return 'System: Animation not found: '+name;
     const partSpeed=Number(input.speed===undefined?speed:input.speed);
     const flip=input.flip||'auto', play=input.play||'normal';
+    if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
     resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play});
@@ -1479,10 +1506,10 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(canvas){
       if(!token.transforms.has(canvas)) token.transforms.set(canvas,canvas.style.transform);
       const original=token.transforms.get(canvas);
-      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:original.includes('scaleX(-1)');
+      const defaultLeft=typeof requestedLeft!=='undefined'?requestedLeft:/scaleX\\(-1\\)|scale\\(-1[,)]/.test(original);
       const sx=current.flip==='left'?-1:current.flip==='right'?1:defaultLeft?-1:1;
       const sy=current.flip==='down'?-1:1;
-      canvas.style.transform=current.flip==='auto'?original:'scale('+sx+','+sy+')';
+      canvas.style.transform='scale('+sx+','+sy+')';
     }
     const state=player.animationState;
     const entry=state.getCurrent(0);
@@ -1515,9 +1542,15 @@ window.veliaDisplaySequence=function(names,speed,loop){
   playNext();
   return 'System: Playing sequence: '+resolved.map(x=>x.name).join(' -> ');
 };
+window.veliaStopSequence=function(){
+  if(!window.veliaSequenceToken || !window.veliaSequenceToken.active) return 'System: No active sequence.';
+  interruptDisplay();
+  return 'System: Animation sequence stopped.';
+};
 function interruptDisplay(){
   if(window.veliaSequenceToken){
     window.veliaSequenceToken.cancel();
+    window.veliaSequenceToken=null;
   }
   if(!veliaDisplay) return;
   const restorePerf=veliaDisplay.returnPerf;
