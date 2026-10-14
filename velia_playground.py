@@ -7,10 +7,10 @@ from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint
 from PySide6.QtGui import QFont, QPainter, QPen, QColor
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
-    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect)
+    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
 from room_view import wallpapers, ROOM_SIDE_M
-from operator_spine import SpineRoomView
+from operator_spine import SpineRoomView, available_operators
 
 ROOT = Path(__file__).resolve().parent
 PREF = ROOT / "local" / "preferences" / "playground_settings.json"
@@ -143,6 +143,79 @@ class RoundedComboBox(QComboBox):
         popup.show()
         self.update()
 
+class OperatorPickerDialog(QDialog):
+    """Theme-aware operator picker using the application's custom rounded combo."""
+
+    def __init__(self, parent, choices, title, dark=False, language="zh"):
+        super().__init__(parent)
+        self.setObjectName("operatorPicker")
+        self.setModal(True)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumWidth(430)
+        self.resize(470, 250)
+        background = '#1b1e24' if dark else '#ffffff'
+        foreground = '#f4f5f7' if dark else '#19222e'
+        secondary = '#b4bdca' if dark else '#637082'
+        border = '#454c58' if dark else '#cbd3df'
+        hover = '#343a45' if dark else '#edf1f6'
+        pressed = '#485262' if dark else '#dbe5f0'
+        self.setStyleSheet(f"""
+            QDialog#operatorPicker {{background-color:{background}; border:1px solid {border};
+                                    border-radius:18px;}}
+            QDialog#operatorPicker QLabel {{color:{foreground}; background:transparent; border:none;}}
+            QDialog#operatorPicker QLabel#pickerSub {{color:{secondary};font-size:13px;}}
+            QDialog#operatorPicker QLabel#pickerTitle {{font-size:20px;font-weight:700;}}
+            QDialog#operatorPicker QPushButton {{color:{foreground};background:{background};
+                       border:1px solid {border};border-radius:11px;min-height:40px;padding:4px 16px;font-weight:600;}}
+            QDialog#operatorPicker QPushButton:hover {{background:{hover};}}
+            QDialog#operatorPicker QPushButton:pressed {{background:{pressed};padding-top:6px;padding-bottom:2px;}}
+            QDialog#operatorPicker QComboBox {{background:{background};color:{foreground};border:1px solid {border};
+                       border-radius:10px;padding:10px 14px;min-height:28px;}}
+            QDialog#operatorPicker QComboBox::drop-down {{border:none;width:34px;background:transparent;}}
+            QDialog#operatorPicker QComboBox::down-arrow {{image:none;width:0;height:0;}}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(25, 21, 25, 23)
+        layout.setSpacing(14)
+        title_bar = QHBoxLayout()
+        heading = QLabel(title)
+        heading.setObjectName('pickerTitle')
+        title_bar.addWidget(heading, 1)
+        close_button = QPushButton('×')
+        close_button.setFixedSize(34, 34)
+        close_button.setToolTip('Close')
+        close_button.clicked.connect(self.reject)
+        title_bar.addWidget(close_button)
+        layout.addLayout(title_bar)
+
+        subtitle = QLabel('选择需要加入房间的干员' if language == 'zh' else 'Choose an operator to deploy in the room')
+        subtitle.setObjectName('pickerSub')
+        layout.addWidget(subtitle)
+        self.combo = RoundedComboBox(self)
+        self.combo.set_dark(dark)
+        self.combo.setMinimumHeight(48)
+        for name in choices:
+            self.combo.addItem(name, name)
+        layout.addWidget(self.combo)
+        layout.addStretch(1)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        cancel = QPushButton('取消' if language == 'zh' else 'Cancel')
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton('确认添加' if language == 'zh' else 'Deploy')
+        confirm.setEnabled(bool(choices))
+        confirm.clicked.connect(self.accept)
+        actions.addWidget(cancel)
+        actions.addWidget(confirm)
+        layout.addLayout(actions)
+
+    def selected_operator(self):
+        return self.combo.currentData()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -222,14 +295,10 @@ class MainWindow(QMainWindow):
         self.stage_title.setObjectName("cardTitle")
         phead.addWidget(self.stage_title)
         phead.addStretch()
+        self.add_operator_btn = self._button(action=self._add_operator)
+        phead.addWidget(self.add_operator_btn)
         self.operator_label = QLabel()
         phead.addWidget(self.operator_label)
-        self.operator_combo = RoundedComboBox()
-        self.operator_combo.setMinimumWidth(140)
-        self.operator_combo.addItem("初雪 / Enya", "Enya")
-        self.operator_combo.addItem("令 / Ling", "Ling")
-        self.operator_combo.currentIndexChanged.connect(self._operator_changed)
-        phead.addWidget(self.operator_combo)
         self.wallpaper_label = QLabel()
         phead.addWidget(self.wallpaper_label)
         self.wallpaper_combo = RoundedComboBox()
@@ -240,8 +309,9 @@ class MainWindow(QMainWindow):
         self.to_room = self._button(action=lambda: self.stack.setCurrentWidget(self.room))
         phead.addWidget(self.to_room)
         pl.addLayout(phead)
-        self.stage = SpineRoomView(operator_name="Enya")
+        self.stage = SpineRoomView(operator_name=None)
         self.stage.setObjectName("stage")
+        self.stage.controlledChanged.connect(self._update_operator_label)
         self.stage_layout = pl
         pl.addWidget(self.stage, 1)
         self._refresh_wallpapers()
@@ -323,33 +393,39 @@ class MainWindow(QMainWindow):
         sl.addStretch()
         self.stack.addWidget(self.settings)
 
-    def _operator_changed(self, index):
-        """Switch controlled operator without mixing independent Spine skeletons."""
-        operator_name = self.operator_combo.itemData(index)
-        if not operator_name or operator_name == self.stage.operator_name:
-            return
-        operator_dir = ROOT / "resource" / "op" / operator_name
-        if not (operator_dir / "mov").is_dir():
-            QMessageBox.warning(self, "Velia Playground", f"Missing operator resource: {operator_dir / 'mov'}")
-            self.operator_combo.blockSignals(True)
-            self.operator_combo.setCurrentIndex(self.operator_combo.findData(self.stage.operator_name))
-            self.operator_combo.blockSignals(False)
-            return
-        previous = self.stage
-        new_stage = SpineRoomView(operator_name=operator_name)
-        new_stage.setObjectName("stage")
-        new_stage.set_theme("light" if self.prefs["theme"] == "light" else "dark")
-        new_stage.set_wallpaper(self.wallpaper_combo.currentData())
-        self.stage_layout.replaceWidget(previous, new_stage)
-        self.stage = new_stage
-        previous.close()
-        previous.setParent(None)
-        previous.deleteLater()
+    def _choose_operator(self, choices, title):
+        if not choices:
+            QMessageBox.information(self, 'Velia Playground',
+                self.tr2('没有可添加的干员。', 'No operators available to add.'))
+            return None
+        picker = OperatorPickerDialog(self, choices, title,
+                                      dark=self.prefs['theme'] == 'dark',
+                                      language=self.prefs['language'])
+        return picker.selected_operator() if picker.exec() == QDialog.DialogCode.Accepted else None
+
+    def _add_operator(self):
+        available = [name for name in available_operators()
+                     if name not in self.stage.placed_operator_names()]
+        chosen = self._choose_operator(available, self.tr2('添加干员', 'Add operator'))
+        if chosen:
+            self.stage.add_operator(chosen)
+            self._update_operator_label()
+
+    def _update_operator_label(self):
+        controlled = self.stage.controlled_actor()
+        name = controlled.operator_name if controlled else '—'
+        self.operator_label.setText(self.tr2('控制中: ', 'Controlling: ') + name)
 
     def _enter_playground(self):
         self._refresh_wallpapers()
+        if not self.stage.placed_operator_names():
+            chosen = self._choose_operator(available_operators(),
+                       self.tr2('首次进入 · 选择干员', 'First entry · Select operator'))
+            if not chosen:
+                return
+            self.stage.add_operator(chosen)
+        self._update_operator_label()
         self.stack.setCurrentWidget(self.playground)
-        self.stage.spawn_again()
 
     def _refresh_wallpapers(self):
         current = self.wallpaper_combo.currentData()
@@ -382,10 +458,11 @@ class MainWindow(QMainWindow):
         self.welcome.setText(t("欢迎来到 Velia", "Welcome to Velia"))
         self.home_sub.setText(t("Playground · 独立开发版本", "Playground · Standalone foundation"))
         self.playground_title.setText(t("游乐场", "Playground"))
-        self.playground_desc.setText(t("角色、互动与场景系统已清空，等待重新设计。", "Character, interaction and scene systems cleared for redesign."))
+        self.playground_desc.setText(t("多干员游乐场 · 自主巡游与角色控制", "Multi-operator playground · autonomous wandering and player control"))
         self.enter_btn.setText(t("进入游乐场 ↗", "Enter Playground ↗"))
         self.stage_title.setText(t("游乐场 / 10 × 10 m", "Playground / 10 × 10 m"))
-        self.operator_label.setText(t("干员", "Operator"))
+        self.add_operator_btn.setText(t("添加干员 +", "Add operator +"))
+        self._update_operator_label()
         self.wallpaper_label.setText(t("房间壁纸", "Room wallpaper"))
         self._refresh_wallpapers()
         self.to_room.setText(t("联机房间 ↗", "Multiplayer Room ↗"))
@@ -410,7 +487,7 @@ class MainWindow(QMainWindow):
         bg, panel, text, muted, border, button, hover, accent, active = (
             ("#f4f5f7","#ffffff","#131820","#637082","#d5dbe3","#ffffff","#edf0f4","#202831","#d7dfe9") if light else
             ("#101114","#1a1c21","#f4f5f7","#a6afbc","#393d45","#24272e","#363a43","#f0f2f5","#525864"))
-        for combo in (self.operator_combo, self.wallpaper_combo, self.theme_combo, self.language_combo):
+        for combo in (self.wallpaper_combo, self.theme_combo, self.language_combo):
             combo.set_dark(not light)
         self.stage.set_theme("light" if light else "dark")
         self.setStyleSheet(f"""

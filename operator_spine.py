@@ -10,7 +10,7 @@ import math
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, QTimer, QEvent
+from PySide6.QtCore import Qt, QUrl, QTimer, QEvent, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QLabel, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QPushButton
 
@@ -56,6 +56,11 @@ def load_operator(name):
 ACTOR_RADIUS_M = 0.34
 DEFAULT_WALK_MPS = 1.40
 MOVE_RESPONSE_S = 0.085  # smooth acceleration / braking (seconds)
+# Render a much larger *transparent* viewport without changing the visible
+# operator height. The camera's world-space extent expands by this factor too.
+SPINE_STAGE_OVERSCAN = 3.0
+SPINE_FOOT_ANCHOR = 0.68  # relative to the oversized canvas, top=0
+
 
 
 def can_stand(x, z, radius=ACTOR_RADIUS_M):
@@ -107,6 +112,15 @@ def height_multiplier(name):
         return value if math.isfinite(value) and value > 0 else 1.0
     except (OSError, ValueError, TypeError, AttributeError):
         return 1.0
+
+
+def available_operators():
+    """Only directories with an installed MOV skeleton are selectable."""
+    if not OP_DIR.is_dir():
+        return []
+    return sorted((folder.name for folder in OP_DIR.iterdir()
+                   if folder.is_dir() and len(list((folder / 'mov').glob('*.skel'))) == 1),
+                  key=str.casefold)
 
 
 def parse_console_entry(value):
@@ -172,15 +186,29 @@ class RoomConsole(QFrame):
                     '//help — Show all available commands and their functions.\n'
                     '//gotosleep — Enter sleep mode, stop movement, and loop Sleep.\n'
                     '//wakeup — Exit sleep mode and resume movement and Relax.\n'
+                    '//oppick NAME — Control an operator already in the room.\n'
+                    '//oplist — List all installed operators.\n'
+                    '//oprelease — Release all operators from the room.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
                 )
             elif content == 'gotosleep':
-                self.room.set_sleeping(True)
+                self.room.controlled_actor().set_sleeping(True) if self.room.controlled_actor() else None
                 self.log.appendPlainText('System: Sleeping.')
             elif content == 'wakeup':
-                self.room.set_sleeping(False)
+                self.room.controlled_actor().set_sleeping(False) if self.room.controlled_actor() else None
                 self.log.appendPlainText('System: Awake.')
+            elif content == 'oplist':
+                self.log.appendPlainText('Operators: ' + (', '.join(available_operators()) or '(none)'))
+            elif content == 'oprelease':
+                self.room.release_all()
+                self.log.appendPlainText('System: All operators released.')
+            elif content.startswith('oppick '):
+                target = content[7:].strip()
+                if self.room.pick_operator(target):
+                    self.log.appendPlainText('System: Controlling ' + self.room.controlled_actor().operator_name)
+                else:
+                    self.log.appendPlainText('System: Operator not present. Use //oplist.')
             else:
                 self.log.appendPlainText('System: Unknown command.')
         else:
@@ -190,6 +218,7 @@ class RoomConsole(QFrame):
 
 
 class SpineRoomView(RoomView):
+    controlledChanged = Signal()
     """Room with one initially stationary Spine 3.8 operator above the floor."""
     def __init__(self, parent=None, operator_name='Enya'):
         super().__init__(parent)
@@ -219,18 +248,130 @@ class SpineRoomView(RoomView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # App-level filter keeps WASD functional even if a Qt button has focus.
         QApplication.instance().installEventFilter(self)
-        self._request_setup()
+        self._is_npc = False
+        self._npc_timer_end = 0.0
+        self._npc_direction = (0, 0)
+        self._actors = {}  # owned by root room; independent Spine instances
+        self._control_name = operator_name
+        if operator_name is not None:
+            self._request_setup()
         self.console = RoomConsole(self)
         self.console.setGeometry(18, max(10, self.height()-225), max(200, self.width()-36), 205)
         self._keep_console_on_top()
 
     def _keep_console_on_top(self):
-        """Keep translucent command panel above the Chromium Spine surface."""
-        if not hasattr(self, "console"):
+        """Depth-sort operators back-to-front; console always above all."""
+        root = self
+        while isinstance(root.parentWidget(), SpineRoomView):
+            root = root.parentWidget()
+        if root is not self:
+            root._keep_console_on_top()
             return
-        if self.overlay is not None:
-            self.overlay.stackUnder(self.console)
-        self.console.raise_()
+        if not hasattr(root, 'console'):
+            return
+        layers = []
+        if root.overlay is not None:
+            layers.append((root.spawn_z, root.operator_name or '', root.overlay))
+        for name, actor in root._actors.items():
+            if actor.overlay is not None:
+                # The ACTOR widget, not the inner WebEngine child, is a
+                # sibling of the root overlay; Qt sibling z-order applies here.
+                layers.append((actor.spawn_z, name, actor))
+        layers.sort(key=lambda x: (x[0], x[1]))
+        identity = tuple(id(layer) for _, _, layer in layers)
+        # Reorder only when two actors cross in depth, are added, or removed.
+        if identity != getattr(root, '_layer_order', None):
+            for _, _, layer in layers:
+                layer.raise_()
+            root._layer_order = identity
+            root.console.raise_()
+        elif root.console.isVisible():
+            # No repeated native-window reshuffle during normal movement.
+            pass
+
+    def controlled_actor(self):
+        if self._control_name == self.operator_name and self.operator_name:
+            return self
+        return self._actors.get(self._control_name)
+
+    def add_operator(self, name):
+        canonical = next((n for n in available_operators() if n.casefold() == name.casefold()), None)
+        if not canonical or canonical == self.operator_name or canonical in self._actors:
+            return False
+        if self.operator_name is None:
+            self.operator_name = canonical
+            self._control_name = canonical
+            self.spawn_x, self.spawn_z = sample_spawn()
+            self._request_setup()
+        else:
+            actor = SpineRoomView(self, operator_name=canonical)
+            # Additional actor layers never repaint the walls or floor.
+            actor.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+            actor.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            actor.paintEvent = lambda event: None
+            actor.console.hide()
+            QApplication.instance().removeEventFilter(actor)
+            actor._is_npc = True
+            actor.setGeometry(self.rect())
+            actor.show()
+            self._actors[canonical] = actor
+        self._keep_console_on_top()
+        self.controlledChanged.emit()
+        return True
+
+    def pick_operator(self, name):
+        name = name.casefold().strip()
+        available = {n.casefold(): n for n in self.placed_operator_names()}
+        if name not in available:
+            return False
+        chosen = available[name]
+        self._control_name = chosen
+        self._is_npc = chosen != self.operator_name
+        self._held_keys.clear()
+        for actor in self._actors.values():
+            actor._held_keys.clear()
+            actor._is_npc = actor.operator_name != chosen
+        self.controlledChanged.emit()
+        return True
+
+    def placed_operator_names(self):
+        return ([self.operator_name] if self.operator_name else []) + list(self._actors)
+
+    def release_all(self):
+        for actor in list(self._actors.values()):
+            actor.close()
+            actor.setParent(None)
+            actor.deleteLater()
+        self._actors.clear()
+        self._control_name = None
+        self._held_keys.clear()
+        self._is_npc = False
+        if self.overlay:
+            self.overlay.stop()
+            self.overlay.deleteLater()
+            self.overlay = None
+        self._ready_poll.stop()
+        self._ready = False
+        self.operator_name = None
+        self._keep_console_on_top()
+        self.controlledChanged.emit()
+
+    def _npc_decide(self, now):
+        if now < self._npc_timer_end:
+            return
+        self._held_keys.clear()
+        if self._npc_direction != (0, 0):
+            self._npc_direction = (0, 0)
+            self._npc_timer_end = now + random.uniform(7.0, 16.0)
+        else:
+            self._npc_direction = random.choice(((1, 0), (-1, 0), (0, 1), (0, -1),
+                                                 (1, 1), (-1, 1), (1, -1), (-1, -1)))
+            self._npc_timer_end = now + random.uniform(0.8, 2.2)
+        x, z = self._npc_direction
+        if x < 0: self._held_keys.add('a')
+        if x > 0: self._held_keys.add('d')
+        if z < 0: self._held_keys.add('w')
+        if z > 0: self._held_keys.add('s')
 
     def _request_setup(self):
         if not WEBENGINE_AVAILABLE:
@@ -261,6 +402,7 @@ class SpineRoomView(RoomView):
         except (OSError, ValueError) as exc:
             self._warning(str(exc))
             return
+        self._layer_order = None
         self.overlay = QWebEngineView(self)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.overlay.setStyleSheet('background:transparent;border:none;')
@@ -304,7 +446,8 @@ class SpineRoomView(RoomView):
         if event.key() == Qt.Key.Key_C and typ == QEvent.Type.KeyPress and not event.isAutoRepeat():
             self.toggle_console()
             return True
-        if self.console.isVisible() or self._sleeping:
+        controlled = self.controlled_actor()
+        if self.console.isVisible() or controlled is None or controlled._sleeping:
             self._held_keys.clear()
             return super().eventFilter(obj, event)
         key_map = {Qt.Key.Key_W:'w',Qt.Key.Key_A:'a',Qt.Key.Key_S:'s',Qt.Key.Key_D:'d'}
@@ -313,9 +456,9 @@ class SpineRoomView(RoomView):
             return super().eventFilter(obj, event)
         if not event.isAutoRepeat():
             if typ == QEvent.Type.KeyPress:
-                self._held_keys.add(key)
+                controlled._held_keys.add(key)
             else:
-                self._held_keys.discard(key)
+                controlled._held_keys.discard(key)
         return True
 
     def _set_motion_animation(self, moving, facing_left):
@@ -337,6 +480,8 @@ class SpineRoomView(RoomView):
             self._velocity_x = self._velocity_z = 0.0
             return
 
+        if self._is_npc and not self._sleeping:
+            self._npc_decide(now)
         if self._sleeping:
             self._held_keys.clear()
             self._velocity_x = self._velocity_z = 0.0
@@ -457,10 +602,11 @@ function normalizeStage(player){
   if(!(size.x>0 && size.y>0)) return;
   const box=player.parent.getBoundingClientRect();
   const ratio=Math.max(.1,box.width/Math.max(1,box.height));
-  const worldHeight=Math.max(size.y/.80, size.x/(ratio*.85));
+  const baseWorldHeight=Math.max(size.y/.80, size.x/(ratio*.85));
+  const worldHeight=baseWorldHeight*3.0;
   const worldWidth=worldHeight*ratio;
   player.currentViewport={x:offset.x+size.x/2-worldWidth/2,
-    y:offset.y-worldHeight*.06,width:worldWidth,height:worldHeight,
+    y:offset.y-worldHeight*.32,width:worldWidth,height:worldHeight,
     padLeft:0,padRight:0,padTop:0,padBottom:0};
   player.previousViewport=null;
 }
@@ -488,7 +634,7 @@ window.veliaSetDepthScale=function(scale){
   const safe=Math.max(.01,Math.min(5,Number(scale)||1));
   for(const el of [document.getElementById('mov'),document.getElementById('perf')]){
     if(!el) continue;
-    el.style.transformOrigin='50%% 94%%';
+    el.style.transformOrigin='50%% 68%%';
     el.style.transform='scale('+safe.toFixed(6)+')';
   }
 };
@@ -583,7 +729,7 @@ window.veliaSetDepthScale=function(scale){
   const safe=Math.max(.01,Math.min(5,Number(scale)||1));
   for(const el of [document.getElementById('mov'),document.getElementById('perf')]){
     if(!el) continue;
-    el.style.transformOrigin='50%% 94%%';
+    el.style.transformOrigin='50%% 68%%';
     el.style.transform='scale('+safe.toFixed(6)+')';
   }
 };
@@ -602,26 +748,31 @@ window.veliaSetMotion=function(moving,left){
   if(canvas) canvas.style.transform=left ? 'scaleX(-1)' : 'scaleX(1)';
   if(anim!==lastMovAnim){lastMovAnim=anim;movPlayer.animationState.setAnimation(0,anim,true);}
 };
-// A shared screen-space character box: 80%% of available stage height.
-// Each distinct Spine skeleton gets its own camera bounds so the character
-// retains identical screen size / bottom anchor when swapping skeletons.
-function normalizeStage(player){
-  if(!player || !player.skeleton || !player.currentViewport) return;
+// One world-space camera for BOTH skeletons. Never fit Start's effect bounds.
+// The MOV Relax pose defines the shared unit scale; (0,0) is the same
+// skeleton-origin/foot anchor in both files, as verified in the viewer.
+let sharedCamera=null;
+function initializeSharedCamera(player){
+  if(!player || !player.skeleton || !player.currentViewport) return false;
   player.skeleton.updateWorldTransform();
   const offset=new spine.Vector2(), size=new spine.Vector2();
   player.skeleton.getBounds(offset,size);
-  if(!(size.x>0 && size.y>0)) return;
+  if(!(size.x>0 && size.y>0)) return false;
   const box=player.parent.getBoundingClientRect();
   const ratio=Math.max(.1,box.width/Math.max(1,box.height));
-  // Size both renderers from their ACTUAL attachments, not PNG dimensions.
-  const worldHeight=Math.max(size.y/.80, size.x/(ratio*.85));
+  const baseHeight=Math.max(size.y/.80,size.x/(ratio*.85));
+  const worldHeight=baseHeight*3.0; // account for large Start effects
   const worldWidth=worldHeight*ratio;
-  // Visible foot rests at 94%% stage height, horizontally centered.
-  const v={x:offset.x+size.x/2-worldWidth/2,
-           y:offset.y-worldHeight*.06,
-           width:worldWidth,height:worldHeight,
-           padLeft:0,padRight:0,padTop:0,padBottom:0};
-  player.currentViewport=v;
+  // Do NOT center on (offset.x, offset.y) from the current animation.
+  // This keeps MOV and PERF at the exact same skeletal origin.
+  sharedCamera={x:-worldWidth/2,y:-worldHeight*.32,
+    width:worldWidth,height:worldHeight,
+    padLeft:0,padRight:0,padTop:0,padBottom:0};
+  return true;
+}
+function applySharedCamera(player){
+  if(!sharedCamera || !player) return;
+  player.currentViewport=Object.assign({},sharedCamera);
   player.previousViewport=null;
 }
 function showRelax(){
@@ -631,7 +782,7 @@ function showRelax(){
     movPlayer.animationState.setAnimation(0,'Relax',true);
     movPlayer.skeleton.setToSetupPose();
     movPlayer.animationState.apply(movPlayer.skeleton);
-    normalizeStage(movPlayer);
+    applySharedCamera(movPlayer);
   }
   document.getElementById('mov').style.visibility='visible';
   document.getElementById('perf').style.visibility='hidden';
@@ -643,38 +794,52 @@ function readyPerf(player){
   player.animationState.timeScale=files.motionSpeed;
   const clip=player.skeleton.data.findAnimation('Start');
   if(!clip){console.error('Missing perf Start animation');document.title='VELIA_SPINE_ERROR';return;}
-  // The bundled Spine player defaults to looping: explicitly play Start once.
   player.animationState.clearTracks();
-  player.animationState.setAnimation(0,'Start',false);
-  player.animationState.apply(player.skeleton);
-  normalizeStage(player);
-  setTimeout(()=>{document.title='VELIA_SPINE_READY';},120);
+  player.animationState.timeScale=0;
   player.animationState.addListener({complete:function(entry){
     if(entry.animation && entry.animation.name==='Start'){
       startComplete=true;
       showRelax();
     }
   }});
-  // Load the second skeleton in parallel, but show it only after Start completes.
-  new spine.SpinePlayer('mov',Object.assign({},params,{
-    skelUrl:files.movSkel,atlasUrl:files.movAtlas,animation:'Relax',
-    success:function(relax){
-      movPlayer=relax;
-      relax.animationState.timeScale=files.motionSpeed;
-      if (!relax.skeleton.data.findAnimation('Relax')){
-        console.error('Missing mov Relax animation');return;
-      }
-      relax.animationState.setAnimation(0,'Relax',true);
-      relax.animationState.apply(relax.skeleton);
-      normalizeStage(relax);
-      relaxReady=true;
-      showRelax();
-    },error:function(p,msg){console.error('MOV/Relax',msg);document.title='VELIA_SPINE_ERROR';}
-  }));
+  maybeStartPerf();
+}
+// Load both skeletons in parallel to reduce startup latency; wait until MOV
+// supplies the shared camera before making PERF visible / starting Start.
+let perfStarted=false;
+function maybeStartPerf(){
+  if(perfStarted || !relaxReady || !perfPlayer || !sharedCamera) return;
+  perfStarted=true;
+  applySharedCamera(perfPlayer);
+  // Begin PERF only when the MOV-based camera is available.
+  perfPlayer.animationState.clearTracks();
+  perfPlayer.animationState.setAnimation(0,'Start',false);
+  perfPlayer.animationState.timeScale=files.motionSpeed;
+  perfPlayer.animationState.apply(perfPlayer.skeleton);
+  setTimeout(()=>{document.title='VELIA_SPINE_READY';},120);
 }
 new spine.SpinePlayer('perf',Object.assign({},params,{
   skelUrl:files.perfSkel,atlasUrl:files.perfAtlas,animation:'Start',
-  success:readyPerf,error:function(p,msg){console.error('PERF/Start',msg);document.title='VELIA_SPINE_ERROR';}
+  success:readyPerf,
+  error:function(p,msg){console.error('PERF/Start',msg);document.title='VELIA_SPINE_ERROR';}
+}));
+new spine.SpinePlayer('mov',Object.assign({},params,{
+  skelUrl:files.movSkel,atlasUrl:files.movAtlas,animation:'Relax',
+  success:function(relax){
+    movPlayer=relax;
+    relax.animationState.timeScale=files.motionSpeed;
+    if(!relax.skeleton.data.findAnimation('Relax')){
+      console.error('Missing mov Relax animation');document.title='VELIA_SPINE_ERROR';return;
+    }
+    relax.animationState.setAnimation(0,'Relax',true);
+    relax.animationState.apply(relax.skeleton);
+    if(!initializeSharedCamera(relax)){
+      console.error('Unable to calibrate MOV viewport');document.title='VELIA_SPINE_ERROR';return;
+    }
+    applySharedCamera(relax);
+    relaxReady=true;
+    maybeStartPerf();
+  },error:function(p,msg){console.error('MOV/Relax',msg);document.title='VELIA_SPINE_ERROR';}
 }));
 </script></body></html>''' % (css_url, lib_url, json.dumps(conf, ensure_ascii=False))
 
@@ -689,19 +854,22 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
         half = back_half + (front_half - back_half) * t
         cx = w / 2 + (self.spawn_x / ROOM_SIDE_M * 2 - 1) * half
         floor_y = h * (.48 + (.925 - .48) * t)
-        # A constant-sized Chromium canvas prevents re-layout and camera
-        # normalization from running for every 1px change in depth.
+        # Triple the transparent Chromium stage; the JS camera is expanded
+        # by the same factor, preserving the original 150..200 px actor size.
+        # This gives wide/long animations room to travel without clipping.
         reference_room_height = 733.0
         viewport_occupancy = .80
-        max_actor_h = (200.0 / reference_room_height * h) / viewport_occupancy
-        actor_w = max_actor_h * 1.60
-        target_w, target_h = max(1, round(actor_w)), max(1, round(max_actor_h))
+        original_h = (200.0 / reference_room_height * h) / viewport_occupancy
+        original_w = original_h * 1.60
+        actor_h = original_h * SPINE_STAGE_OVERSCAN
+        actor_w = original_w * SPINE_STAGE_OVERSCAN
+        target_w, target_h = max(1, round(actor_w)), max(1, round(actor_h))
         if not self._ready:
             self.overlay.setGeometry(-10000, -10000, target_w, target_h)
             return
-        # Place the constant canvas using one fixed 94% foot anchor.
+        # Spine camera and CSS scale share the same fixed foot anchor.
         self.overlay.setGeometry(round(cx - actor_w / 2),
-                                 round(floor_y - max_actor_h * .94),
+                                 round(floor_y - actor_h * SPINE_FOOT_ANCHOR),
                                  target_w, target_h)
         # Change ONLY the DOM element's size, not the WebEngine viewport.
         # One shared screen-space scale for all operators at the same depth.
@@ -717,15 +885,20 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
             self._keep_console_on_top()
 
     def toggle_console(self):
+        controlled = self.controlled_actor()
         if self.console.isVisible():
             self.console.hide()
             self.setFocus(Qt.FocusReason.OtherFocusReason)
         else:
             self._held_keys.clear()
             self._velocity_x = self._velocity_z = 0.0
-            self._set_motion_animation(False, self._facing_left)
+            if controlled is not None:
+                controlled._held_keys.clear()
+                controlled._velocity_x = controlled._velocity_z = 0.0
+                controlled._set_motion_animation(False, controlled._facing_left)
             self.console.show()
             self._keep_console_on_top()
+            self.console.raise_()
             self.console.edit.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def set_sleeping(self, sleeping):
@@ -743,6 +916,9 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
             self._moving_animation = False
 
     def mousePressEvent(self, event):
+        active = self.controlled_actor()
+        if active is not None and active is not self:
+            return active._click_at(event.position())
         if event.button() == Qt.MouseButton.LeftButton and self._ready and not self._sleeping:
             w, h = float(self.width()), float(self.height())
             t = self._depth_fraction(self.spawn_z)
@@ -757,8 +933,19 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
                 return
         super().mousePressEvent(event)
 
+    def _click_at(self, position):
+        if not self._ready or self._sleeping:
+            return
+        from types import SimpleNamespace
+        event = SimpleNamespace(button=lambda: Qt.MouseButton.LeftButton,
+                                position=lambda: position,
+                                accept=lambda: None)
+        self.mousePressEvent(event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        for actor in getattr(self, '_actors', {}).values():
+            actor.setGeometry(self.rect())
         self._fit_overlay()
         if hasattr(self, 'console'):
             self.console.setGeometry(18, max(10, self.height() - 225),
@@ -767,6 +954,8 @@ new spine.SpinePlayer('perf',Object.assign({},params,{
 
     def closeEvent(self, event):
         self._walk_timer.stop()
+        for actor in list(getattr(self, '_actors', {}).values()):
+            actor.close()
         QApplication.instance().removeEventFilter(self)
         super().closeEvent(event)
 
