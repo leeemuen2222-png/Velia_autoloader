@@ -4,16 +4,21 @@ import os
 import sys
 from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint, QPointF
-from PySide6.QtGui import QFont, QPainter, QPen, QColor
+from PySide6.QtGui import QFont, QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
-    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog, QToolButton)
+    QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog, QToolButton, QGridLayout)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
 from room_view import wallpapers, ROOM_SIDE_M
-from operator_spine import SpineRoomView, available_operators
+from operator_spine import SpineRoomView, available_operators, load_operator, RUNTIME_DIR, OP_DIR, WEBENGINE_AVAILABLE
 
 ROOT = Path(__file__).resolve().parent
 PREF = ROOT / "local" / "preferences" / "playground_settings.json"
+if WEBENGINE_AVAILABLE:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtCore import QUrl
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+
 DEFAULT_URL = os.environ.get("VELIA_MULTIPLAYER_URL", "ws://127.0.0.1:8765")
 
 def load_preferences():
@@ -256,6 +261,125 @@ class OperatorPickerDialog(QDialog):
         return self.combo.currentData()
 
 
+class OperatorCard(AnimatedButton):
+    """Whole-card click, hover/press animation, portrait and Spine preview."""
+
+    def _animate(self, height):
+        # Cards must never inherit AnimatedButton's 40/44 px height animation.
+        return
+
+    def enterEvent(self, event):
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(23)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 52))
+        self.setGraphicsEffect(shadow)
+        self._glow = QPropertyAnimation(shadow, b'blurRadius', self)
+        self._glow.setDuration(160)
+        self._glow.setStartValue(9)
+        self._glow.setEndValue(23)
+        self._glow.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.setGraphicsEffect(None)
+        super().leaveEvent(event)
+
+    def __init__(self, name, dark=False, parent=None):
+        super().__init__('', parent)
+        self.name = name
+        self.setObjectName('operatorCard')
+        self.setMinimumHeight(204)
+        self.setMaximumHeight(204)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setStyleSheet('')
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(14, 10, 14, 10)
+        self._layout.setSpacing(10)
+        left = QVBoxLayout()
+        left.setSpacing(5)
+        portrait = QLabel()
+        portrait.setFixedSize(108, 112)
+        portrait.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        portrait.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        portrait.setObjectName('portrait')
+        folder = OP_DIR / name / 'pic'
+        portrait_file = folder / 'oph.png'
+        if portrait_file.is_file():
+            pix = QPixmap(str(portrait_file))
+            if not pix.isNull():
+                portrait.setPixmap(pix.scaled(108, 112, Qt.AspectRatioMode.KeepAspectRatio,
+                                             Qt.TransformationMode.SmoothTransformation))
+            else:
+                portrait.setText('OP')
+        else:
+            portrait.setText('OP')
+        left.addWidget(portrait, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.name_label = QLabel(name)
+        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        left.addWidget(self.name_label)
+        self._layout.addLayout(left)
+        self._layout.addStretch(1)
+        self.preview = None
+        self.preview_placeholder = QLabel('MOV / Relax')
+        self.preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.preview_placeholder.setMinimumSize(170, 138)
+        self.preview_placeholder.setMaximumHeight(138)
+        self.preview_placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._layout.addWidget(self.preview_placeholder)
+
+    def activate_preview(self):
+        if self.preview is not None:
+            return
+        if WEBENGINE_AVAILABLE:
+            try:
+                (_, mov) = load_operator(self.name)
+                skel = mov[0]
+                playerjs = (RUNTIME_DIR / 'spine-player.js').as_uri()
+                playercss = (RUNTIME_DIR / 'spine-player.css').as_uri()
+                settings = json.dumps({'skel':skel.as_uri(), 'atlas':skel.with_suffix('.atlas').as_uri()})
+                html = '''<!doctype html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="%s"><style>html,body,#preview{margin:0;width:100%%;height:100%%;overflow:hidden;background:transparent!important}.spine-player{height:100%%!important;background:transparent!important}.spine-player-controls,.spine-player-logo,.spine-player-error,.spine-player-loading,.spine-player-loading-screen{display:none!important}</style>
+</head><body><div id="preview"></div><script src="%s"></script><script>
+const c=%s;
+new spine.SpinePlayer('preview',{skelUrl:c.skel,atlasUrl:c.atlas,animation:'Relax',
+showControls:false,alpha:true,backgroundColor:'#00000000',premultipliedAlpha:true,
+showLoading:false,success:function(player){const o=new spine.Vector2(),z=new spine.Vector2();
+player.skeleton.updateWorldTransform();player.skeleton.getBounds(o,z);
+const h=Math.max(z.y/0.80,z.x/1.7)*1.25;
+player.currentViewport={x:o.x+z.x/2-h*0.9,y:o.y-h*0.12,width:h*1.8,height:h,padLeft:0,padRight:0,padTop:0,padBottom:0};
+player.previousViewport=null;}});
+</script></body></html>''' % (playercss, playerjs, settings)
+                self.preview = QWebEngineView(self)
+                self.preview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                self.preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                self.preview.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+                self.preview.page().setBackgroundColor(QColor(0,0,0,0))
+                self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,True)
+                self.preview.setMinimumSize(170,138)
+                self.preview.setMaximumHeight(138)
+                self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                self.preview.setHtml(html,QUrl.fromLocalFile(str(ROOT)+'/'))
+                self._layout.replaceWidget(self.preview_placeholder, self.preview)
+                self.preview_placeholder.hide()
+            except (OSError,ValueError,IndexError):
+                pass
+
+    def deactivate_preview(self):
+        if self.preview is None:
+            return
+        view = self.preview
+        self.preview = None
+        self._layout.replaceWidget(view, self.preview_placeholder)
+        self.preview_placeholder.show()
+        view.hide()
+        view.setParent(None)
+        view.setHtml('')
+        view.deleteLater()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -357,6 +481,56 @@ class MainWindow(QMainWindow):
         self._refresh_wallpapers()
         self.stack.addWidget(self.playground)
 
+        self.operator_page = QWidget()
+        self.operator_page.setObjectName('operatorPage')
+        op_layout = QVBoxLayout(self.operator_page)
+        op_layout.setContentsMargins(22, 14, 22, 14)
+        op_layout.setSpacing(12)
+        chooser_header = QHBoxLayout()
+        self.chooser_heading = QLabel('选择干员')
+        self.chooser_heading.setObjectName('cardTitle')
+        chooser_header.addWidget(self.chooser_heading)
+        chooser_header.addStretch(1)
+        self.chooser_back = self._button('返回', self._leave_operator_page)
+        chooser_header.addWidget(self.chooser_back)
+        op_layout.addLayout(chooser_header)
+        filters = QHBoxLayout()
+        self.operator_search = QLineEdit()
+        self.operator_search.setPlaceholderText('搜索干员 / Search operators')
+        self.operator_search.textChanged.connect(self._filter_operator_cards)
+        filters.addWidget(self.operator_search,1)
+        self.chooser_filter = self._button('筛选（即将推出）')
+        self.chooser_filter.setEnabled(False)
+        filters.addWidget(self.chooser_filter)
+        op_layout.addLayout(filters)
+        self.chooser_scroll = QScrollArea()
+        self.chooser_scroll.setWidgetResizable(True)
+        self.chooser_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chooser_scroll.setObjectName('operatorChooserScroll')
+        self.chooser_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chooser_content = QWidget()
+        self.chooser_content.setObjectName('operatorChooserContent')
+        self.chooser_items = QGridLayout(self.chooser_content)
+        self.chooser_items.setContentsMargins(10, 10, 10, 10)
+        self.chooser_items.setHorizontalSpacing(14)
+        self.chooser_items.setVerticalSpacing(14)
+        self.chooser_items.setColumnStretch(0, 1)
+        self.chooser_items.setColumnStretch(1, 1)
+        self.chooser_scroll.setWidget(self.chooser_content)
+        op_layout.addWidget(self.chooser_scroll,1)
+        self._operator_cards = []
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._refresh_operator_previews)
+        self._pending_previews = []
+        self._preview_batch_timer = QTimer(self)
+        self._preview_batch_timer.setInterval(210)
+        self._preview_batch_timer.timeout.connect(self._load_next_operator_preview)
+        self.chooser_scroll.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._preview_timer.start(90))
+        self._chooser_source = self.home
+        self.stack.addWidget(self.operator_page)
+
         self.room = QWidget()
         rl = QVBoxLayout(self.room)
         rl.setContentsMargins(16,12,16,12)
@@ -443,13 +617,100 @@ class MainWindow(QMainWindow):
                                       language=self.prefs['language'])
         return picker.selected_operator() if picker.exec() == QDialog.DialogCode.Accepted else None
 
-    def _add_operator(self):
-        available = [name for name in available_operators()
-                     if name not in self.stage.placed_operator_names()]
-        chosen = self._choose_operator(available, self.tr2('添加干员', 'Add operator'))
-        if chosen:
-            self.stage.add_operator(chosen)
+    def _show_operator_page(self, source):
+        self._chooser_source = source
+        self._preview_timer.stop()
+        self._preview_batch_timer.stop()
+        self._pending_previews.clear()
+        for card in self._operator_cards:
+            card.deactivate_preview()
+            self.chooser_items.removeWidget(card)
+            card.setParent(None)
+            card.deleteLater()
+        self._operator_cards = []
+        available = [name for name in available_operators() if name not in self.stage.placed_operator_names()]
+        dark = self.prefs['theme'] == 'dark'
+        for idx, name in enumerate(available):
+            card = OperatorCard(name,dark,self.chooser_content)
+            card.clicked.connect(lambda checked=False, selected=name: self._select_operator_card(selected))
+            self.chooser_items.addWidget(card, idx // 2, idx % 2)
+            self._operator_cards.append(card)
+        self._pending_previews = list(self._operator_cards)
+        self.operator_search.clear()
+        self.chooser_heading.setText(self.tr2('选择干员','Select operator'))
+        self.stack.setCurrentWidget(self.operator_page)
+        self._preview_timer.start(40)
+        self._preview_batch_timer.start()
+
+    def _filter_operator_cards(self, query):
+        search = query.casefold().strip()
+        for card in self._operator_cards:
+            card.setVisible(search in card.name.casefold())
+        self._reflow_operator_cards()
+        self._preview_timer.start(60)
+
+    def _reflow_operator_cards(self):
+        # Reflow visible cards without destroying running Spine previews.
+        row = 0
+        col = 0
+        for card in self._operator_cards:
+            if card.isHidden():
+                continue
+            self.chooser_items.addWidget(card, row, col)
+            col += 1
+            if col == 2:
+                col = 0
+                row += 1
+
+    def _refresh_operator_previews(self):
+        if self.stack.currentWidget() is not self.operator_page:
+            return
+        # Prioritize currently visible cards; do not stop any existing player.
+        viewport = self.chooser_scroll.viewport()
+        visible = []
+        for card in self._operator_cards:
+            if card.isHidden() or card.preview is not None:
+                continue
+            y = card.mapTo(viewport, QPoint(0, 0)).y()
+            if -card.height() < y < viewport.height():
+                visible.append(card)
+        queue = visible + [c for c in self._operator_cards if not c.isHidden() and c.preview is None and c not in visible]
+        self._pending_previews = queue
+        if queue and not self._preview_batch_timer.isActive():
+            self._preview_batch_timer.start()
+
+    def _load_next_operator_preview(self):
+        if self.stack.currentWidget() is not self.operator_page:
+            self._preview_batch_timer.stop()
+            return
+        while self._pending_previews:
+            card = self._pending_previews.pop(0)
+            if card in self._operator_cards and not card.isHidden() and card.preview is None:
+                card.activate_preview()
+                break
+        if not self._pending_previews:
+            self._preview_batch_timer.stop()
+
+    def _select_operator_card(self, name):
+        if self.stage.add_operator(name):
+            self._preview_timer.stop()
+            self._preview_batch_timer.stop()
+            self._pending_previews.clear()
+            for card in self._operator_cards:
+                card.deactivate_preview()
             self._update_operator_label()
+            self.stack.setCurrentWidget(self.playground)
+
+    def _leave_operator_page(self):
+        self._preview_timer.stop()
+        self._preview_batch_timer.stop()
+        self._pending_previews.clear()
+        for card in self._operator_cards:
+            card.deactivate_preview()
+        self.stack.setCurrentWidget(self._chooser_source)
+
+    def _add_operator(self):
+        self._show_operator_page(self.playground)
 
     def _update_operator_label(self):
         controlled = self.stage.controlled_actor()
@@ -459,11 +720,8 @@ class MainWindow(QMainWindow):
     def _enter_playground(self):
         self._refresh_wallpapers()
         if not self.stage.placed_operator_names():
-            chosen = self._choose_operator(available_operators(),
-                       self.tr2('首次进入 · 选择干员', 'First entry · Select operator'))
-            if not chosen:
-                return
-            self.stage.add_operator(chosen)
+            self._show_operator_page(self.home)
+            return
         self._update_operator_label()
         self.stack.setCurrentWidget(self.playground)
 
@@ -551,6 +809,19 @@ class MainWindow(QMainWindow):
         QComboBox::down-arrow {{image:none;width:0px;height:0px;}}
         QComboBox:hover {{background:{hover};border-color:{muted};}}
         QComboBox:pressed {{background:{active};}}
+        QWidget#operatorPage {{background:{bg};}}
+        QScrollArea {{background:{bg};border:0px;}}
+        QScrollArea > QWidget > QWidget {{background:{bg};}}
+        QWidget#operatorChooserContent {{background:{bg};}}
+        QScrollBar:vertical {{background:{bg};width:10px;margin:4px 1px;border:none;}}
+        QScrollBar::handle:vertical {{background:{border};min-height:40px;border-radius:4px;}}
+        QScrollBar::handle:vertical:hover {{background:{muted};}}
+        QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {{height:0px;border:none;background:transparent;}}
+        QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical {{background:transparent;}}
+        QPushButton#operatorCard {{background:{panel};border:1px solid {border};border-radius:16px;padding:0;text-align:left;}}
+        QPushButton#operatorCard:hover {{background:{hover};border-color:{muted};}}
+        QPushButton#operatorCard:pressed {{background:{active};border-color:{text};padding:0;}}
+        QLabel#portrait {{background:{hover};border:1px solid {border};border-radius:12px;}}
         """)
 
     def _change_theme(self):
