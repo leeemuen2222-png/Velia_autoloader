@@ -226,7 +226,7 @@ def parse_alloc_animation(token):
     match = _ANIM_MODIFIERS.fullmatch(token)
     if not match:
         raise ValueError('Invalid animation/modifier syntax: ' + token)
-    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal', 'loop': False, 'frame': None}
+    item = {'name': match.group('name'), 'speed': 1.0, 'flip': 'auto', 'play': 'normal', 'loop': False, 'frame': None, 'allowmovement': False}
     if match.group('mods') is not None:
         if not match.group('mods').strip():
             return item
@@ -235,7 +235,7 @@ def parse_alloc_animation(token):
             if '=' not in part:
                 raise ValueError('Expected key=value in modifier: ' + part)
             key, value = (piece.strip().lower() for piece in part.split('=', 1))
-            if key in used or key not in ('speed', 'flip', 'play', 'loop', 'frame'):
+            if key in used or key not in ('speed', 'flip', 'play', 'loop', 'frame', 'allowmovement'):
                 raise ValueError('Unknown or duplicate animation modifier: ' + key)
             used.add(key)
             if key == 'speed':
@@ -256,9 +256,9 @@ def parse_alloc_animation(token):
                 if end <= start:
                     raise ValueError('frame end must be greater than start')
                 value = [start, end]
-            elif key == 'loop':
+            elif key in ('loop', 'allowmovement'):
                 if value not in ('true', 'false'):
-                    raise ValueError('loop must be true/false')
+                    raise ValueError(key + ' must be true/false')
                 value = value == 'true'
             item[key] = value
     return item
@@ -443,7 +443,7 @@ class RoomConsole(QFrame):
                     '//ani display NAME [SPEED] [loop] — Play an animation.\n'
                     '//ani alloc ANIMATION{modifiers} [...] KEY — Bind an animation sequence to a key.\n'
                     '//ani clearalloc — Remove all custom animation key bindings.\n'
-                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward,loop=true|false,frame=START:END}; fields in any order; auto faces with operator.\n'
+                    'Modifier: {speed=NUMBER,flip=auto|up|down|left|right,play=normal|backward,loop=true|false,frame=START:END,allowmovement=true|false}; fields in any order; auto faces with operator.\n'
                     'E in PERF mode — Play Attack (or Attack_1) without stopping walking.\n'
                     'Tip: Commands begin with //; other text is speech. '
                     'Text containing <...> is always speech.'
@@ -593,10 +593,13 @@ class RoomConsole(QFrame):
             # Keep speech local in this single-player view. Multiplayer transport
             # will be wired when the networked room stage is implemented.
             self.log.appendPlainText('You: ' + content)
+            self.room.networkSpeech.emit(content)
 
 
 class SpineRoomView(RoomView):
     controlledChanged = Signal()
+    networkSpeech = Signal(str)
+    networkAction = Signal(str)
     """Room with one initially stationary Spine 3.8 operator above the floor."""
     def __init__(self, parent=None, operator_name='Enya'):
         super().__init__(parent)
@@ -633,6 +636,8 @@ class SpineRoomView(RoomView):
         self._is_npc = False
         self._npc_timer_end = 0.0
         self._npc_direction = (0, 0)
+        self._network_remote = False
+        self._network_suppress_actions = False
         self._actors = {}  # owned by root room; independent Spine instances
         self._control_name = operator_name
         if operator_name is not None:
@@ -709,7 +714,7 @@ class SpineRoomView(RoomView):
     def pick_operator(self, name):
         name = name.casefold().strip()
         possible = ([self.operator_name] if self.operator_name else []) + list(self._actors)
-        matches = [key for key in possible if key and (key.casefold() == name or key.split('#')[0].casefold() == name)]
+        matches = [key for key in possible if key and (key.casefold() == name or key.split('#')[0].casefold() == name) and not (key in self._actors and self._actors[key]._network_remote)]
         if not matches:
             return False
         chosen = random.choice(matches)
@@ -785,6 +790,80 @@ class SpineRoomView(RoomView):
         self._keep_console_on_top()
         self.controlledChanged.emit()
 
+    def network_add_actor(self, name):
+        if not self.add_operator(name, allow_duplicate=True):
+            return None
+        # The last inserted actor belongs to the remote user. Never let it
+        # wander on the receiving computer.
+        actor = next(reversed(self._actors.values()), None)
+        if actor is not None:
+            actor._network_remote = True
+            actor._is_npc = False
+            actor._held_keys.clear()
+        return actor
+
+    def network_apply_actor(self, actor, data):
+        if actor is None:
+            return
+        try:
+            x = float(data.get('x', actor.spawn_x))
+            z = float(data.get('z', actor.spawn_z))
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(x) and math.isfinite(z)):
+            return
+        actor.spawn_x = min(ROOM_SIDE_M, max(0.0, x))
+        actor.spawn_z = min(ROOM_SIDE_M, max(0.0, z))
+        skin = data.get('skin', actor.skin_number)
+        if isinstance(skin, int) and skin != actor.skin_number:
+            actor.select_skin(skin)
+        actor._fit_overlay()
+        if actor._ready and not actor._deploying:
+            actor._set_motion_animation(bool(data.get('moving')), bool(data.get('left')))
+        self._keep_console_on_top()
+
+    def network_replay_action(self, actor, expression):
+        if actor is None or not actor._ready or actor._deploying:
+            return
+        # Strictly deserialize arguments. Never evaluate untrusted JS received
+        # over the LAN, even when it has an expected function prefix.
+        matched = re.fullmatch(r'window\.(\w+)\s*&&\s*window\.\1\((.*)\)',
+                               str(expression), flags=re.DOTALL)
+        if not matched or len(expression) > 5000:
+            return
+        function, raw = matched.groups()
+        try:
+            args = json.loads('[' + raw + ']')
+        except (ValueError, TypeError):
+            return
+        booleans = ('veliaPerfMode', 'veliaSetSleep')
+        noargs = ('veliaPerfAttack', 'veliaInteract', 'veliaStopSequence')
+        if function in noargs:
+            if args:
+                return
+        elif function in booleans:
+            if len(args) != 1 or type(args[0]) is not bool:
+                return
+        elif function == 'veliaDisplayAnimation':
+            if (len(args) != 3 or not isinstance(args[0], str) or len(args[0]) > 100
+                or type(args[1]) not in (float, int) or type(args[2]) is not bool):
+                return
+        elif function == 'veliaDisplaySequence':
+            if (len(args) != 3 or not isinstance(args[0], list) or len(args[0]) > 20
+                or type(args[1]) not in (float, int) or type(args[2]) is not bool):
+                return
+            if any(not isinstance(clip, (str, dict)) for clip in args[0]):
+                return
+        else:
+            return
+        sanitized = 'window.' + function + ' && window.' + function + '(' + ','.join(
+            json.dumps(arg, ensure_ascii=False, allow_nan=False) for arg in args) + ')'
+        actor._network_suppress_actions = True
+        try:
+            actor._js_command(sanitized)
+        finally:
+            actor._network_suppress_actions = False
+
     def _npc_decide(self, now):
         if now < self._npc_timer_end:
             return
@@ -831,6 +910,12 @@ class SpineRoomView(RoomView):
         return self.overlay is not None
 
     def _js_command(self, expression, callback=None):
+        if not self._network_suppress_actions and not self._network_remote:
+            root = self
+            while isinstance(root.parentWidget(), SpineRoomView):
+                root = root.parentWidget()
+            if root.controlled_actor() is self:
+                root.networkAction.emit(expression)
         if not self.overlay or not self._ready or self._deploying:
             if callback:
                 callback('System: Wait for deployment to finish.')
@@ -980,6 +1065,10 @@ class SpineRoomView(RoomView):
         now = time.monotonic()
         dt = min(max(0.0, now - self._last_tick), 0.045)
         self._last_tick = now
+        if self._network_remote:
+            self._held_keys.clear()
+            self._velocity_x = self._velocity_z = 0.0
+            return
         if not self._ready or self._deploying or not self.isVisible():
             self._held_keys.clear()
             self._velocity_x = self._velocity_z = 0.0
@@ -1189,7 +1278,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
-    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame});
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame,allowmovement:input.allowmovement===true});
   }
   if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
   const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
@@ -1216,6 +1305,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     token.listeners=[];
     if(token.raf){cancelAnimationFrame(token.raf);token.raf=0;}
     const current=resolved[index];
+    token.allowMovement=!!current.allowmovement;
     const result=window.veliaDisplayAnimation(current.name,current.speed,true);
     if(typeof result==='string'&&!result.startsWith('System: Playing')){token.cancel();return;}
     if(veliaDisplay && null) veliaDisplay.returnPerf=token.restorePerf;
@@ -1319,6 +1409,12 @@ window.veliaSetDepthScale=function(scale){
   }
 };
 window.veliaSetMotion=function(moving, left){
+  if(veliaDisplay && window.veliaSequenceToken && window.veliaSequenceToken.active &&
+     window.veliaSequenceToken.allowMovement){
+    const canvas=document.querySelector('#mov canvas');
+    if(canvas) canvas.style.transform=left?'scaleX(-1)':'scaleX(1)';
+    return;
+  }
   if(moving && veliaDisplay) interruptDisplay();
   else if(!moving && veliaDisplay) return;
   if(!veliaMovPlayer || !veliaMovPlayer.animationState || veliaSleeping) return;
@@ -1565,7 +1661,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     if(input.loop!==undefined && typeof input.loop!=='boolean') return 'System: Invalid loop modifier for '+name;
     if(!Number.isFinite(partSpeed)||partSpeed<=0||!['auto','up','down','left','right'].includes(flip)||!['normal','backward'].includes(play))
       return 'System: Invalid animation modifier for '+name;
-    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame});
+    resolved.push({name:kind+'/'+clip.name,model:kind,clip:clip.name,speed:partSpeed,flip:flip,play:play,frame:frame,allowmovement:input.allowmovement===true});
   }
   if(window.veliaSequenceToken) window.veliaSequenceToken.cancel();
   const token={active:true,listeners:[],raf:0,restorePerf:typeof perfMode==='boolean'?perfMode:false,transforms:new Map()};
@@ -1592,6 +1688,7 @@ window.veliaDisplaySequence=function(names,speed,loop){
     token.listeners=[];
     if(token.raf){cancelAnimationFrame(token.raf);token.raf=0;}
     const current=resolved[index];
+    token.allowMovement=!!current.allowmovement;
     const result=window.veliaDisplayAnimation(current.name,current.speed,true);
     if(typeof result==='string'&&!result.startsWith('System: Playing')){token.cancel();return;}
     if(veliaDisplay && perfPlayer) veliaDisplay.returnPerf=token.restorePerf;
@@ -1703,6 +1800,12 @@ window.veliaSetDepthScale=function(scale){
   }
 };
 window.veliaSetMotion=function(moving,left){
+  if(veliaDisplay && window.veliaSequenceToken && window.veliaSequenceToken.active &&
+     window.veliaSequenceToken.allowMovement){
+    const canvas=document.querySelector('#mov canvas');
+    if(canvas) canvas.style.transform=left?'scaleX(-1)':'scaleX(1)';
+    return;
+  }
   if(moving && veliaDisplay) interruptDisplay();
   else if(!moving && veliaDisplay) return;
   if(perfMode){
@@ -1911,7 +2014,7 @@ new spine.SpinePlayer('mov',Object.assign({},params,{
             character_h = (150.0 + 50.0 * self.spawn_z / ROOM_SIDE_M) / 733.0 * h * height_multiplier(self.operator_name)
             # Bounding box is intentionally conservative for moving Spine parts.
             if abs(event.position().x() - center_x) <= character_h * .52 and foot_y-character_h <= event.position().y() <= foot_y:
-                self.overlay.page().runJavaScript('window.veliaInteract && window.veliaInteract();')
+                self._js_command('window.veliaInteract && window.veliaInteract()')
                 event.accept()
                 return
         super().mousePressEvent(event)

@@ -2,15 +2,20 @@
 import json
 import os
 import sys
+import subprocess
+import secrets
+import time
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint, QPointF
+from PySide6.QtCore import Qt, QTimer, QEasingCurve, QPropertyAnimation, QPoint, QPointF, QProcess
 from PySide6.QtGui import QFont, QPainter, QPen, QColor, QPixmap
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
     QComboBox, QSizePolicy, QScrollArea, QGraphicsDropShadowEffect, QDialog, QToolButton, QGridLayout)
 from multiplayer_client import MultiplayerClient, MULTIPLAYER_AVAILABLE
 from room_view import wallpapers, ROOM_SIDE_M
-from operator_spine import SpineRoomView, available_operators, load_operator, RUNTIME_DIR, OP_DIR, WEBENGINE_AVAILABLE
+from operator_spine import (SpineRoomView, available_operators, load_operator,
+                            RUNTIME_DIR, OP_DIR, WEBENGINE_AVAILABLE)
+from lan_invite import create_invite, decode_invite, local_ipv4
 
 ROOT = Path(__file__).resolve().parent
 PREF = ROOT / "local" / "preferences" / "playground_settings.json"
@@ -262,7 +267,7 @@ class OperatorPickerDialog(QDialog):
 
 
 class OperatorCard(AnimatedButton):
-    """Whole-card click, hover/press animation, portrait and Spine preview."""
+    """Whole-card click with portrait and pre-rendered operator artwork."""
 
     def _animate(self, height):
         # Cards must never inherit AnimatedButton's 40/44 px height animation.
@@ -289,15 +294,16 @@ class OperatorCard(AnimatedButton):
         super().__init__('', parent)
         self.name = name
         self.setObjectName('operatorCard')
-        self.setMinimumHeight(162)
-        self.setMaximumHeight(162)
+        self.setMinimumHeight(202)
+        self.setMaximumHeight(202)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet('')
         self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(9, 6, 9, 6)
-        self._layout.setSpacing(6)
+        self._layout.setContentsMargins(14, 12, 14, 12)
+        self._layout.setSpacing(10)
         left = QVBoxLayout()
-        left.setSpacing(2)
+        left.setSpacing(6)
+        left.setContentsMargins(0, 0, 0, 0)
         portrait = QLabel()
         portrait.setFixedSize(58, 61)
         portrait.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -316,82 +322,39 @@ class OperatorCard(AnimatedButton):
             portrait.setText('OP')
         left.addWidget(portrait, alignment=Qt.AlignmentFlag.AlignHCenter)
         self.name_label = QLabel(name)
-        self.name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.name_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        left.addSpacing(6)
         left.addWidget(self.name_label)
+        left.addStretch(1)
         self._layout.addLayout(left)
         self._layout.addStretch(1)
-        self.preview = None
-        self.preview_placeholder = QLabel('MOV / Relax')
-        self.preview_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.preview_placeholder.setMinimumSize(110, 146)
-        self.preview_placeholder.setMaximumHeight(146)
-        self.preview_placeholder.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self._layout.addWidget(self.preview_placeholder)
+
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.preview_label.setMinimumSize(170, 170)
+        self.preview_label.setMaximumSize(240, 170)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        image_file = folder / 'op_select.png'
+        if not image_file.is_file():
+            image_file = folder / (name + '_op_select.png')
+        if not image_file.is_file():
+            image_file = ROOT / (name + '_op_select.png')
+        pix = QPixmap(str(image_file)) if image_file.is_file() else QPixmap()
+        if not pix.isNull():
+            self.preview_label.setPixmap(pix.scaled(
+                self.preview_label.maximumWidth(), self.preview_label.maximumHeight(),
+                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.preview_label.setText('请安装 pic/op_select.png')
+        self._layout.addWidget(self.preview_label)
 
     def activate_preview(self):
-        if self.preview is not None:
-            return
-        if WEBENGINE_AVAILABLE:
-            try:
-                (_, mov) = load_operator(self.name)
-                skel = mov[0]
-                playerjs = (RUNTIME_DIR / 'spine-player.js').as_uri()
-                playercss = (RUNTIME_DIR / 'spine-player.css').as_uri()
-                settings = json.dumps({'skel':skel.as_uri(), 'atlas':skel.with_suffix('.atlas').as_uri()})
-                html = '''<!doctype html><html><head><meta charset="utf-8">
-<link rel="stylesheet" href="%s"><style>html,body,#preview{margin:0;width:100%%;height:100%%;overflow:hidden;background:transparent!important}.spine-player{height:100%%!important;background:transparent!important}.spine-player-controls,.spine-player-logo,.spine-player-error,.spine-player-loading,.spine-player-loading-screen{display:none!important}</style>
-</head><body><div id="preview"></div><script src="%s"></script><script>
-const c=%s;
-new spine.SpinePlayer('preview',{skelUrl:c.skel,atlasUrl:c.atlas,animation:'Relax',
-showControls:false,alpha:true,backgroundColor:'#00000000',premultipliedAlpha:true,
-showLoading:false,success:function(player){const o=new spine.Vector2(),z=new spine.Vector2();
-player.skeleton.updateWorldTransform();player.skeleton.getBounds(o,z);
-// Use one shared on-screen target for every operator, calibrated to
-// Enya's card preview. The source atlas's pixel dimensions are irrelevant.
-// Keep the complete visible geometry in view if an attachment is unusually wide.
-const el=document.getElementById('preview');
-const cw=Math.max(1,el.clientWidth), ch=Math.max(1,el.clientHeight);
-const aspect=Math.max(0.5,cw/ch);
-const targetHeightPx=118;
-const margin=1.10;
-// Size by the CHARACTER'S HEIGHT, never by overall width. Ling's very wide
-// decoration/tail makes width-fitting shrink her to a tiny sprite.
-const h=Math.max(1,z.y)*ch/targetHeightPx*margin;
-const w=h*aspect;
-// Align visual feet consistently, regardless of how far the attachments
-// extend horizontally. The X centre still follows each skeleton's geometry.
-player.currentViewport={x:o.x+z.x/2-w/2,y:o.y+z.y/2-h/2,
-width:w,height:h,padLeft:0,padRight:0,padTop:0,padBottom:0};
-player.previousViewport=null;}});
-</script></body></html>''' % (playercss, playerjs, settings)
-                self.preview = QWebEngineView(self)
-                self.preview.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-                self.preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                self.preview.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-                self.preview.page().setBackgroundColor(QColor(0,0,0,0))
-                self.preview.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,True)
-                self.preview.setMinimumSize(110,146)
-                self.preview.setMaximumHeight(146)
-                self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                self.preview.setHtml(html,QUrl.fromLocalFile(str(ROOT)+'/'))
-                self._layout.replaceWidget(self.preview_placeholder, self.preview)
-                self.preview_placeholder.hide()
-            except (OSError,ValueError,IndexError):
-                pass
+        return
 
     def deactivate_preview(self):
-        if self.preview is None:
-            return
-        view = self.preview
-        self.preview = None
-        self._layout.replaceWidget(view, self.preview_placeholder)
-        self.preview_placeholder.show()
-        view.hide()
-        view.setParent(None)
-        view.setHtml('')
-        view.deleteLater()
+        return
 
 
 class MainWindow(QMainWindow):
@@ -400,6 +363,11 @@ class MainWindow(QMainWindow):
         self.prefs = load_preferences()
         self.client = MultiplayerClient(self)
         self.joined = False
+        self._lan_host = False
+        self._host_entered = False
+        self._lan_invite = ""
+        self._server_process = None
+        self._join_key = ""
         self.members = set()
         self._build()
         self._connect_signals()
@@ -490,6 +458,34 @@ class MainWindow(QMainWindow):
         self.stage = SpineRoomView(operator_name=None)
         self.stage.setObjectName("stage")
         self.stage.controlledChanged.connect(self._update_operator_label)
+        self.stage.networkSpeech.connect(self._send_room_speech)
+        self.stage.networkAction.connect(self._send_room_action)
+        self._lan_status_overlay = QLabel(self.stage)
+        self._lan_status_overlay.setObjectName('lanStatusOverlay')
+        self._lan_status_overlay.setStyleSheet('background:rgba(18,25,33,185);color:#ffffff;'
+                                               'border:1px solid rgba(255,255,255,80);'
+                                               'border-radius:12px;padding:9px 12px;'
+                                               'font:12px Segoe UI;')
+        self._lan_status_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._lan_status_overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._lan_status_overlay.hide()
+        self._lan_status_overlay.setFixedWidth(205)
+        self._lan_overlay_timer = QTimer(self)
+        self._lan_overlay_timer.setInterval(250)
+        self._lan_overlay_timer.timeout.connect(self._position_lan_overlay)
+        self._lan_overlay_timer.start()
+        self._net_send_timer = QTimer(self)
+        self._net_send_timer.setInterval(50)
+        self._net_send_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._net_send_timer.timeout.connect(self._send_actor_state)
+        self._net_send_timer.start()
+        self._remote_actors = {}
+        self._remote_pending = {}
+        self._remote_action_queue = {}
+        self._local_user_id = None
+        self._roster_by_id = {}
+        self._lan_active = False
+        self._local_actor_published = False
         self.stage_layout = pl
         pl.addWidget(self.stage, 1)
         self._refresh_wallpapers()
@@ -532,71 +528,87 @@ class MainWindow(QMainWindow):
         self.chooser_items.setVerticalSpacing(14)
         self.chooser_items.setColumnStretch(0, 1)
         self.chooser_items.setColumnStretch(1, 1)
-        self.chooser_items.setColumnStretch(2, 1)
-        self.chooser_items.setColumnStretch(3, 1)
         self.chooser_scroll.setWidget(self.chooser_content)
         op_layout.addWidget(self.chooser_scroll,1)
         self._operator_cards = []
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.timeout.connect(self._refresh_operator_previews)
+        self._preview_timer = None
         self._pending_previews = []
-        self._preview_batch_timer = QTimer(self)
-        self._preview_batch_timer.setInterval(210)
-        self._preview_batch_timer.timeout.connect(self._load_next_operator_preview)
-        self.chooser_scroll.verticalScrollBar().valueChanged.connect(
-            lambda _value: self._preview_timer.start(90))
+        self._preview_batch_timer = None
         self._chooser_source = self.home
         self.stack.addWidget(self.operator_page)
 
         self.room = QWidget()
         rl = QVBoxLayout(self.room)
-        rl.setContentsMargins(16,12,16,12)
-        rl.setSpacing(16)
-        self.room_title = QLabel()
-        self.room_title.setObjectName("cardTitle")
+        rl.setContentsMargins(16, 12, 16, 12)
+        rl.setSpacing(15)
+        self.room_title = QLabel('联机房间')
+        self.room_title.setObjectName('cardTitle')
         rl.addWidget(self.room_title)
-        self.room_note = QLabel()
-        self.room_note.setObjectName("muted")
-        rl.addWidget(self.room_note)
-        form = QFrame()
-        form.setObjectName("card")
-        fl = QVBoxLayout(form)
-        fl.setContentsMargins(22,22,22,22)
-        fl.setSpacing(11)
-        self.url_label = QLabel()
-        fl.addWidget(self.url_label)
-        self.url_input = QLineEdit(DEFAULT_URL)
-        fl.addWidget(self.url_input)
-        self.id_label = QLabel()
-        fl.addWidget(self.id_label)
-        self.id_input = QLineEdit(os.environ.get("VELIA_MULTIPLAYER_ROOM", "public-01"))
-        fl.addWidget(self.id_input)
-        self.nick_label = QLabel()
-        fl.addWidget(self.nick_label)
-        self.nick_input = QLineEdit()
-        self.nick_input.setMaxLength(24)
-        fl.addWidget(self.nick_input)
-        controls=QHBoxLayout()
-        self.connect_btn = self._button(action=self._join,kind="primary")
-        self.disconnect_btn = self._button(action=self._disconnect)
-        self.disconnect_btn.setEnabled(False)
-        controls.addWidget(self.connect_btn)
-        controls.addWidget(self.disconnect_btn)
-        controls.addStretch()
-        fl.addLayout(controls)
-        rl.addWidget(form)
-        self.status = QLabel()
-        self.status.setObjectName("muted")
-        rl.addWidget(self.status)
-        self.members_label = QLabel()
-        self.members_label.setObjectName("cardTitle")
-        rl.addWidget(self.members_label)
-        self.members_view = QLabel()
-        self.members_view.setObjectName("muted")
-        self.members_view.setWordWrap(True)
-        rl.addWidget(self.members_view)
-        rl.addStretch()
+        self.lan_pages = QStackedWidget()
+        rl.addWidget(self.lan_pages, 1)
+        self.lan_start = QWidget()
+        v = QVBoxLayout(self.lan_start)
+        v.addWidget(QLabel('选择联机方式 / Connection mode'))
+        btn=self._button('本地联机 / LAN', lambda: self.lan_pages.setCurrentWidget(self.lan_actions), 'primary'); v.addWidget(btn)
+        btn=self._button('网络联机（即将推出）', lambda: self.lan_pages.setCurrentWidget(self.internet_placeholder)); v.addWidget(btn)
+        v.addStretch()
+        self.lan_pages.addWidget(self.lan_start)
+        self.internet_placeholder=QWidget()
+        v=QVBoxLayout(self.internet_placeholder)
+        v.addWidget(QLabel('网络联机仍在开发中 / Internet multiplayer coming soon'))
+        v.addWidget(self._button('返回', lambda: self.lan_pages.setCurrentWidget(self.lan_start)))
+        v.addStretch()
+        self.lan_pages.addWidget(self.internet_placeholder)
+        self.lan_actions=QWidget()
+        v=QVBoxLayout(self.lan_actions)
+        v.addWidget(QLabel('本地联机 / LAN'))
+        v.addWidget(self._button('建立房间', lambda: self.lan_pages.setCurrentWidget(self.lan_host_page), 'primary'))
+        v.addWidget(self._button('加入房间', lambda: self.lan_pages.setCurrentWidget(self.lan_join_page)))
+        v.addWidget(self._button('返回', lambda: self.lan_pages.setCurrentWidget(self.lan_start)))
+        v.addStretch()
+        self.lan_pages.addWidget(self.lan_actions)
+        self.lan_host_page=QWidget()
+        v=QVBoxLayout(self.lan_host_page)
+        v.setSpacing(9)
+        v.addWidget(QLabel('建立本地房间'))
+        v.addWidget(QLabel('房间名称'))
+        self.host_room_name=QLineEdit('Velia LAN Room'); v.addWidget(self.host_room_name)
+        v.addWidget(QLabel('房主昵称'))
+        self.host_nickname=QLineEdit(); self.host_nickname.setPlaceholderText('未知玩家'); v.addWidget(self.host_nickname)
+        self.host_launch=self._button('启动服务器并生成邀请码', self._create_lan_room, 'primary')
+        v.addWidget(self.host_launch)
+        self.host_info=QLabel('尚未创建房间'); self.host_info.setWordWrap(True); self.host_info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.host_info)
+        self.host_copy=self._button('复制邀请码', self._copy_invite); self.host_copy.setEnabled(False); v.addWidget(self.host_copy)
+        v.addWidget(self._button('返回', lambda: self.lan_pages.setCurrentWidget(self.lan_actions)))
+        v.addStretch()
+        self.lan_pages.addWidget(self.lan_host_page)
+        self.lan_join_page=QWidget()
+        v=QVBoxLayout(self.lan_join_page)
+        v.addWidget(QLabel('输入房主分享的邀请码，无需填写服务器地址'))
+        self.join_invite_input=QLineEdit(); self.join_invite_input.setMaxLength(40); v.addWidget(self.join_invite_input)
+        self.invite_hint=QLabel('等待输入邀请码'); v.addWidget(self.invite_hint)
+        self.join_invite_input.textChanged.connect(self._validate_invite)
+        v.addWidget(QLabel('昵称'))
+        self.join_nickname=QLineEdit(); self.join_nickname.setPlaceholderText('未知玩家'); v.addWidget(self.join_nickname)
+        self.join_connect=self._button('加入房间', self._join_lan, 'primary'); self.join_connect.setEnabled(False); v.addWidget(self.join_connect)
+        v.addWidget(self._button('返回', lambda: self.lan_pages.setCurrentWidget(self.lan_actions)))
+        v.addStretch()
+        self.lan_pages.addWidget(self.lan_join_page)
+        self.lan_wait=QWidget()
+        v=QVBoxLayout(self.lan_wait)
+        self.lan_wait_heading=QLabel('房间等候区'); self.lan_wait_heading.setObjectName('cardTitle'); v.addWidget(self.lan_wait_heading)
+        self.status=QLabel('正在连接...'); v.addWidget(self.status)
+        self.room_key_view=QLabel(); self.room_key_view.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); v.addWidget(self.room_key_view)
+        self.members_label=QLabel('房间内玩家'); v.addWidget(self.members_label)
+        self.members_view=QLabel(''); self.members_view.setWordWrap(True); v.addWidget(self.members_view)
+        self.enter_multiplayer=self._button('进入房间并选择干员', self._enter_lan_playground, 'primary')
+        self.enter_multiplayer.setEnabled(False)
+        v.addWidget(self.enter_multiplayer)
+        self.disconnect_btn=self._button('退出房间', self._disconnect); v.addWidget(self.disconnect_btn)
+        v.addStretch()
+        self.lan_pages.addWidget(self.lan_wait)
+        self.lan_pages.setCurrentWidget(self.lan_start)
         self.stack.addWidget(self.room)
 
         self.settings = QWidget()
@@ -637,8 +649,10 @@ class MainWindow(QMainWindow):
 
     def _show_operator_page(self, source):
         self._chooser_source = source
-        self._preview_timer.stop()
-        self._preview_batch_timer.stop()
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        if self._preview_batch_timer is not None:
+            self._preview_batch_timer.stop()
         self._pending_previews.clear()
         for card in self._operator_cards:
             card.deactivate_preview()
@@ -651,21 +665,18 @@ class MainWindow(QMainWindow):
         for idx, name in enumerate(available):
             card = OperatorCard(name,dark,self.chooser_content)
             card.clicked.connect(lambda checked=False, selected=name: self._select_operator_card(selected))
-            self.chooser_items.addWidget(card, idx // 4, idx % 4)
+            self.chooser_items.addWidget(card, idx // 2, idx % 2)
             self._operator_cards.append(card)
-        self._pending_previews = list(self._operator_cards)
+        self._pending_previews = []
         self.operator_search.clear()
         self.chooser_heading.setText(self.tr2('选择干员','Select operator'))
         self.stack.setCurrentWidget(self.operator_page)
-        self._preview_timer.start(40)
-        self._preview_batch_timer.start()
 
     def _filter_operator_cards(self, query):
         search = query.casefold().strip()
         for card in self._operator_cards:
             card.setVisible(search in card.name.casefold())
         self._reflow_operator_cards()
-        self._preview_timer.start(60)
 
     def _reflow_operator_cards(self):
         # Reflow visible cards without destroying running Spine previews.
@@ -676,52 +687,32 @@ class MainWindow(QMainWindow):
                 continue
             self.chooser_items.addWidget(card, row, col)
             col += 1
-            if col == 4:
+            if col == 2:
                 col = 0
                 row += 1
 
     def _refresh_operator_previews(self):
-        if self.stack.currentWidget() is not self.operator_page:
-            return
-        # Prioritize currently visible cards; do not stop any existing player.
-        viewport = self.chooser_scroll.viewport()
-        visible = []
-        for card in self._operator_cards:
-            if card.isHidden() or card.preview is not None:
-                continue
-            y = card.mapTo(viewport, QPoint(0, 0)).y()
-            if -card.height() < y < viewport.height():
-                visible.append(card)
-        queue = visible + [c for c in self._operator_cards if not c.isHidden() and c.preview is None and c not in visible]
-        self._pending_previews = queue
-        if queue and not self._preview_batch_timer.isActive():
-            self._preview_batch_timer.start()
+        return
 
     def _load_next_operator_preview(self):
-        if self.stack.currentWidget() is not self.operator_page:
-            self._preview_batch_timer.stop()
-            return
-        while self._pending_previews:
-            card = self._pending_previews.pop(0)
-            if card in self._operator_cards and not card.isHidden() and card.preview is None:
-                card.activate_preview()
-                break
-        if not self._pending_previews:
-            self._preview_batch_timer.stop()
+        return
 
     def _select_operator_card(self, name):
         if self.stage.add_operator(name):
-            self._preview_timer.stop()
-            self._preview_batch_timer.stop()
             self._pending_previews.clear()
-            for card in self._operator_cards:
-                card.deactivate_preview()
             self._update_operator_label()
             self.stack.setCurrentWidget(self.playground)
+            if self._lan_active:
+                self._send_actor_state()
+                for uid, state in list(self._remote_pending.items()):
+                    self._update_remote_actor(uid, state)
+                self._update_lan_status()
 
     def _leave_operator_page(self):
-        self._preview_timer.stop()
-        self._preview_batch_timer.stop()
+        if self._preview_timer is not None:
+            self._preview_timer.stop()
+        if self._preview_batch_timer is not None:
+            self._preview_batch_timer.stop()
         self._pending_previews.clear()
         for card in self._operator_cards:
             card.deactivate_preview()
@@ -783,13 +774,6 @@ class MainWindow(QMainWindow):
         self._refresh_wallpapers()
         self.to_room.setText(t("联机房间 ↗", "Multiplayer Room ↗"))
         self.room_title.setText(t("联机房间", "Multiplayer Room"))
-        self.room_note.setText(t("仅保留连接与成员列表。已移除角色、动画和所有聊天功能。", "Connections and member lists only. All avatars, animations and chat removed."))
-        self.url_label.setText(t("服务器地址", "Server URL"))
-        self.id_label.setText(t("房间编号", "Room ID"))
-        self.nick_label.setText(t("昵称", "Nickname"))
-        self.connect_btn.setText(t("连接", "Connect"))
-        self.disconnect_btn.setText(t("断开", "Disconnect"))
-        self.members_label.setText(t("房间成员", "Room members"))
         self.settings_title.setText(t("界面设置", "Appearance settings"))
         self.theme_label.setText(t("主题", "Theme"))
         self.theme_combo.setItemText(0,t("白昼", "Light"))
@@ -853,34 +837,111 @@ class MainWindow(QMainWindow):
         save_preferences(self.prefs)
         self._translate()
 
-    def _join(self):
-        url=self.url_input.text().strip()
-        room=self.id_input.text().strip()
-        name=self.nick_input.text().strip()
-        if not url.startswith(("ws://","wss://")) or not room or not name:
-            QMessageBox.warning(self,self.tr2("无效信息","Invalid input"),self.tr2("请输入有效的 WebSocket 地址、房间编号与昵称。","Enter a WebSocket URL, room ID and nickname."))
-            return
+    def _validate_invite(self, value):
+        try:
+            url, key = decode_invite(value)
+            self.invite_hint.setText('已识别地址：' + url)
+            self.join_connect.setEnabled(True)
+        except ValueError as exc:
+            self.invite_hint.setText(str(exc))
+            self.join_connect.setEnabled(False)
+
+    def _copy_invite(self):
+        if self._lan_invite:
+            QApplication.clipboard().setText(self._lan_invite)
+
+    def _create_lan_room(self):
         if not MULTIPLAYER_AVAILABLE:
-            QMessageBox.warning(self,"WebSocket",self.tr2("缺少 QtWebSockets 模块。","QtWebSockets is unavailable."))
+            QMessageBox.warning(self, 'QtWebSockets', '当前 PySide6 未包含 QtWebSockets。')
             return
-        self.connect_btn.setEnabled(False)
-        self.status.setText(self.tr2("正在连接…", "Connecting…"))
+        ip=local_ipv4()
+        if ip.startswith('127.'):
+            QMessageBox.warning(self, 'LAN', '没有找到可用的局域网 IPv4 地址。请先连接 Wi-Fi 或以太网。')
+            return
+        key=create_invite(ip)
+        self._lan_invite=key
+        self._join_key=key
+        self._lan_host=True
+        self._host_entered=False
+        if self._server_process is not None:
+            self._server_process.kill()
+            self._server_process.waitForFinished(3000)
+        self._server_process=QProcess(self)
+        from PySide6.QtCore import QProcessEnvironment
+        env=QProcessEnvironment.systemEnvironment()
+        env.insert('VELIA_ROOM_CODE',key)
+        env.insert('VELIA_ROOM_NAME',self.host_room_name.text().strip() or 'Velia LAN Room')
+        self._server_process.setProcessEnvironment(env)
+        server=ROOT/'server.py'
+        self._server_process.setProgram(sys.executable)
+        self._server_process.setArguments([str(server)])
+        self._server_process.readyReadStandardOutput.connect(self._server_output)
+        self._server_process.readyReadStandardError.connect(self._server_error)
+        self._server_process.start()
+        self.host_launch.setEnabled(False)
+        self.host_info.setText('正在启动服务器...')
+
+    def _server_output(self):
+        output=bytes(self._server_process.readAllStandardOutput()).decode('utf-8','replace')
+        if 'VELIA_LAN_READY:' in output:
+            url, _ = decode_invite(self._lan_invite)
+            self.host_info.setText(f'服务器地址：{url}\n房间名称：{self.host_room_name.text().strip() or "Velia LAN Room"}\n邀请码：{self._lan_invite}')
+            self.host_copy.setEnabled(True)
+            self._connect_lan(url)
+        elif 'VELIA_LAN_ERROR:' in output:
+            self._server_error()
+
+    def _server_error(self):
+        error=bytes(self._server_process.readAllStandardError()).decode('utf-8','replace')
+        self.host_launch.setEnabled(True)
+        self.host_info.setText('服务器启动失败：'+(error.strip() or '未知错误。请检查端口 8765 是否被占用以及 websockets 是否安装。'))
+
+    def _join_lan(self):
+        try:
+            url,key=decode_invite(self.join_invite_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self,'邀请码',str(exc))
+            return
+        self._lan_host=False
+        self._join_key=key
+        self._host_entered=False
+        self._connect_lan(url)
+
+    def _connect_lan(self, url):
+        self.join_connect.setEnabled(False)
+        self.status.setText('正在连接 ' + url)
         self.client.connect_to(url)
+        self.lan_pages.setCurrentWidget(self.lan_wait)
 
     def _connected(self):
-        self.client.send({"type":"join","data":{"room_id":self.id_input.text().strip(),"username":self.nick_input.text().strip()}})
-        self.status.setText(self.tr2("已连接，正在加入房间…", "Connected, joining room…"))
+        nickname=(self.host_nickname if self._lan_host else self.join_nickname).text().strip() or '未知玩家'
+        self.client.send({'type':'join','data':{'room_id':self._join_key,'username':nickname,'host':self._lan_host,'room_name':self.host_room_name.text().strip() if self._lan_host else ''}})
+        self.status.setText('已连接，等待服务器确认...')
 
     def _disconnect(self):
         self.client.close()
+        if self._lan_host and self._server_process is not None:
+            self._server_process.kill()
+            self._server_process.waitForFinished(3000)
+            self._server_process=None
+            self.host_launch.setEnabled(True)
         self._disconnected()
+        self.lan_pages.setCurrentWidget(self.lan_actions)
 
     def _disconnected(self):
         self.joined=False
+        self._lan_active = False
+        self._local_actor_published = False
+        self._local_user_id = None
+        for uid in list(self._remote_actors):
+            self._remove_remote_actor(uid)
+        self._remote_pending.clear()
+        self._remote_action_queue.clear()
+        self._lan_status_overlay.hide()
         self.members.clear()
-        self.connect_btn.setEnabled(True)
-        self.disconnect_btn.setEnabled(False)
-        self.status.setText(self.tr2("连接已断开", "Disconnected"))
+        self.join_connect.setEnabled(bool(self.join_invite_input.text().strip()))
+        self.enter_multiplayer.setEnabled(False)
+        self.status.setText('连接已断开')
         self._render_members()
 
     def _error(self, message):
@@ -888,29 +949,166 @@ class MainWindow(QMainWindow):
         self.status.setText(message)
 
     def _message(self, packet):
-        kind=packet.get("type")
-        data=packet.get("data") or {}
-        if kind=="welcome":
+        kind=packet.get('type')
+        data=packet.get('data') or {}
+        if kind=='welcome':
             self.joined=True
-            self.members={p.get("username","") for p in data.get("members",[]) if isinstance(p,dict)}
-            self.members.add(self.nick_input.text().strip())
-            self.disconnect_btn.setEnabled(True)
-            self.connect_btn.setEnabled(False)
-            self.status.setText(self.tr2("已加入房间", "Joined room"))
-        elif kind=="member_joined":
-            self.members.add(str(data.get("username", "")))
-        elif kind=="member_left":
-            self.members.discard(str(data.get("username", "")))
-        elif kind=="error":
-            self.status.setText(str(packet.get("message", "Server error")))
+            self._lan_host=bool(data.get('is_host'))
+            self._host_entered=bool(data.get('host_entered'))
+            self._local_user_id = data.get('your_id')
+            self._remote_pending.update(data.get('actors') or {})
+            self.status.setText('已加入：' + data.get('room_name',''))
+            self.room_key_view.setText('邀请码：' + self._join_key)
+            self._set_members(data.get('members', []))
+        elif kind=='roster':
+            self._set_members(data.get('members', []))
+            self._host_entered=bool(data.get('host_entered'))
+        elif kind=='host_state':
+            self._host_entered=bool(data.get('host_entered'))
+        elif kind == 'actor':
+            uid = data.get('id')
+            if uid != self._local_user_id and isinstance(data.get('state'), dict):
+                self._remote_pending[uid] = data['state']
+                self._update_remote_actor(uid, data['state'])
+        elif kind == 'actor_left':
+            self._remove_remote_actor(data.get('id'))
+        elif kind == 'chat':
+            if data.get('id') != self._local_user_id:
+                self.stage.console.log.appendPlainText(
+                    str(data.get('username') or '未知玩家') + ': ' + str(data.get('text') or ''))
+        elif kind == 'action':
+            uid = data.get('id')
+            if uid != self._local_user_id:
+                actor = self._remote_actors.get(uid)
+                expression = str(data.get('expression') or '')
+                if actor is not None and actor._ready and not actor._deploying:
+                    self.stage.network_replay_action(actor, expression)
+                else:
+                    queue = self._remote_action_queue.setdefault(uid, [])
+                    queue.append((time.monotonic(), expression))
+                    del queue[:-12]
+        elif kind=='error':
+            self.status.setText(str(packet.get('message','Server error')))
             self.client.close()
+        self.enter_multiplayer.setEnabled(self.joined and (self._lan_host or self._host_entered))
+        self._update_lan_status()
+
+    def _set_members(self, members):
+        self._roster_by_id = {p.get('id'):p for p in members if isinstance(p, dict) and p.get('id')}
+        self.members={p.get('username') or '未知玩家' for p in members if isinstance(p,dict)}
         self._render_members()
+        self._update_lan_status()
 
     def _render_members(self):
-        self.members_view.setText(" · ".join(sorted(n for n in self.members if n)) or self.tr2("暂无成员", "No members yet"))
+        self.members_view.setText('\n'.join(sorted(self.members)) if self.members else '暂无成员')
+
+    def _enter_lan_playground(self):
+        if not self.joined or not (self._lan_host or self._host_entered):
+            return
+        if self._lan_host:
+            self.client.send({'type':'host_entered'})
+            self._host_entered=True
+        self._lan_active = True
+        self.client.send({'type':'entered'})
+        self._refresh_wallpapers()
+        self._show_operator_page(self.room)
+
+    def _position_lan_overlay(self):
+        if not self._lan_active or not self.joined:
+            self._lan_status_overlay.hide()
+            return
+        for uid, queue in list(self._remote_action_queue.items()):
+            actor = self._remote_actors.get(uid)
+            if actor is None or not actor._ready or actor._deploying:
+                continue
+            # Replaying stale several-second-old motions is worse than
+            # catching up to the latest still relevant action.
+            for stamp, expression in queue:
+                if time.monotonic() - stamp <= 3.0:
+                    self.stage.network_replay_action(actor, expression)
+            self._remote_action_queue.pop(uid, None)
+        panel = self._lan_status_overlay
+        panel.adjustSize()
+        panel.move(max(8, self.stage.width() - panel.width() - 18), 16)
+        panel.raise_()
+        panel.show()
+
+    def _update_lan_status(self):
+        if not hasattr(self, '_lan_status_overlay') or not self._lan_active:
+            return
+        connected = self.joined
+        text = 'LAN  ·  ' + ('已连接' if connected else '已断开')
+        text += '\n' + ('房主已进入' if self._host_entered or self._lan_host else '等待房主进入')
+        text += '\n成员 (' + str(len(self._roster_by_id)) + '):'
+        for info in self._roster_by_id.values():
+            username = str(info.get('username') or '未知玩家')
+            text += '\n• ' + username + ('  [房主]' if info.get('is_host') else '')
+            text += '  ●' if info.get('entered') else '  ○'
+        self._lan_status_overlay.setText(text)
+        self._position_lan_overlay()
+
+    def _send_room_speech(self, text):
+        if self._lan_active and self.joined:
+            self.client.send({'type':'chat','data':{'text':str(text)[:500]}})
+
+    def _send_room_action(self, expression):
+        if self._lan_active and self.joined:
+            self.client.send({'type':'action','data':{'expression':str(expression)[:5000]}})
+
+    def _send_actor_state(self):
+        if not self._lan_active or not self.joined or self.stack.currentWidget() != self.playground:
+            return
+        actor = self.stage.controlled_actor()
+        if actor is None or not actor.operator_name:
+            if self._local_actor_published:
+                self.client.send({'type':'actor_clear'})
+                self._local_actor_published = False
+            return
+        self._local_actor_published = True
+        self.client.send({'type':'actor','data':{
+            'operator':actor.operator_name,
+            'x':round(actor.spawn_x,4), 'z':round(actor.spawn_z,4),
+            'skin':actor.skin_number, 'moving':actor._moving_animation,
+            'left':actor._facing_left}})
+
+    def _update_remote_actor(self, uid, state):
+        if not uid or not self._lan_active or self.stack.currentWidget() != self.playground:
+            return
+        actor = self._remote_actors.get(uid)
+        operator = state.get('operator')
+        if actor is not None and actor.operator_name != operator:
+            self._remove_remote_actor(uid)
+            actor = None
+        if actor is None:
+            if not self.stage.placed_operator_names():
+                return
+            actor = self.stage.network_add_actor(operator)
+            if actor is None:
+                return
+            self._remote_actors[uid] = actor
+        self.stage.network_apply_actor(actor, state)
+
+    def _remove_remote_actor(self, uid):
+        actor = self._remote_actors.pop(uid, None)
+        self._remote_pending.pop(uid, None)
+        self._remote_action_queue.pop(uid, None)
+        if actor is None:
+            return
+        for key, value in list(self.stage._actors.items()):
+            if value is actor:
+                self.stage._actors.pop(key, None)
+                break
+        actor.close()
+        actor.setParent(None)
+        actor.deleteLater()
+        self.stage._layer_order = None
+        self.stage._keep_console_on_top()
 
     def closeEvent(self,event):
         self.client.close()
+        if self._server_process is not None:
+            self._server_process.kill()
+            self._server_process.waitForFinished(3000)
         super().closeEvent(event)
 
 def main():
