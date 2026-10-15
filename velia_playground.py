@@ -470,6 +470,15 @@ class MainWindow(QMainWindow):
         self._lan_status_overlay.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self._lan_status_overlay.hide()
         self._lan_status_overlay.setFixedWidth(205)
+        # Measure Qt's actual scheduled frame-update cadence (not GPU/WebEngine FPS).
+        self._frame_update_count = 0
+        self._frame_update_fps = 0.0
+        self._frame_measure_start = time.perf_counter()
+        self._frame_tick_timer = QTimer(self)
+        self._frame_tick_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._frame_tick_timer.setInterval(16)  # ~60 Hz; Qt/OS may schedule later.
+        self._frame_tick_timer.timeout.connect(self._measure_frame_tick)
+        self._frame_tick_timer.start()
         self._lan_overlay_timer = QTimer(self)
         self._lan_overlay_timer.setInterval(250)
         self._lan_overlay_timer.timeout.connect(self._position_lan_overlay)
@@ -1033,11 +1042,25 @@ class MainWindow(QMainWindow):
         panel.raise_()
         panel.show()
 
+    def _measure_frame_tick(self):
+        # A measured Qt event-loop update rate. WebEngine renders via its own
+        # requestAnimationFrame loop, so do not label this as actual GPU FPS.
+        now = time.perf_counter()
+        self._frame_update_count += 1
+        elapsed = now - self._frame_measure_start
+        if elapsed >= 0.65:
+            self._frame_update_fps = self._frame_update_count / elapsed
+            self._frame_update_count = 0
+            self._frame_measure_start = now
+            if self._lan_active and self.joined:
+                self._update_lan_status()
+
     def _update_lan_status(self):
         if not hasattr(self, '_lan_status_overlay') or not self._lan_active:
             return
         connected = self.joined
         text = 'LAN  ·  ' + ('已连接' if connected else '已断开')
+        text += '\nUI 更新: ' + (f'{self._frame_update_fps:.0f} FPS' if self._frame_update_fps > 0 else '计算中...') + '  / 目标 60'
         text += '\n' + ('房主已进入' if self._host_entered or self._lan_host else '等待房主进入')
         text += '\n成员 (' + str(len(self._roster_by_id)) + '):'
         for info in self._roster_by_id.values():
